@@ -1,0 +1,4 @@
+interface:
+  display_name: "Klong Image"
+  short_description: "Generate images through Klong with OpenAI or Gemini"
+  default_prompt: "Use $klong-image to generate an image and save it in the current project."
