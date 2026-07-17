@@ -17,6 +17,8 @@
 
 ## 快速开始
 
+> 不熟悉 Codex 配置？查看图文教程：[使用 CC Switch 配置 Codex 接入小恐龙 API](docs/codex-cc-switch.md)。
+
 ### 1. 安装 Skill
 
 把下面这句话发送给 Codex：
@@ -163,6 +165,7 @@ skills/
 
 ## 文档与支持
 
+- [Codex + CC Switch 图文配置教程](docs/codex-cc-switch.md)
 - [模型与价格](https://api.klong.lat/pricing)
 - [图片接口文档](https://docs.klong.lat/zh/docs/api/ai-model/images/openai/post-v1-images-generations)
 - [Codex CLI 教程](https://docs.klong.lat/zh/docs/apps/codex-cli)
