@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import random
+import secrets
 import sys
 import time
 import urllib.error
@@ -29,6 +30,7 @@ GEMINI_MODELS = {
 }
 DEFAULT_OPENAI_MODEL = "gpt-image-2"
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
+MAX_INPUT_BYTES = 20 * 1024 * 1024
 USER_AGENT = "klong-image-skill/0.1"
 SERIAL_MODELS = {"gpt-image-2-codex", "gpt-image-2-vip"}
 
@@ -54,6 +56,56 @@ def validate_image(content: bytes) -> None:
     is_webp = len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP"
     if not is_webp and not any(content.startswith(signature) for signature in signatures):
         raise RuntimeError("The API response is not a supported PNG, JPEG, GIF, or WebP image")
+
+
+def input_image_mime(content: bytes) -> str:
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    raise RuntimeError("Input image must be PNG, JPEG, or WebP")
+
+
+def multipart_body(fields: dict[str, str], filename: str, content: bytes, mime_type: str) -> tuple[bytes, str]:
+    boundary = f"klong-{secrets.token_hex(16)}"
+    chunks = []
+    for name, value in fields.items():
+        chunks.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode("utf-8")
+        )
+    safe_filename = filename.replace('"', "_").replace("\r", "_").replace("\n", "_")
+    chunks.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="{safe_filename}"\r\n'
+        f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8")
+    )
+    chunks.extend((content, b"\r\n", f"--{boundary}--\r\n".encode("ascii")))
+    return b"".join(chunks), boundary
+
+
+def request_multipart(url: str, api_key: str, body: bytes, boundary: str, timeout: int) -> dict:
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+            "User-Agent": USER_AGENT,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(read_limited(response).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read(1001).decode("utf-8", errors="replace")
+        error = f"HTTP {exc.code}: {detail[:1000]}"
+        if exc.code == 429 or 500 <= exc.code <= 599:
+            raise TransientError(error) from exc
+        raise RuntimeError(error) from exc
+    except urllib.error.URLError as exc:
+        raise TransientError(f"Network error: {exc.reason}") from exc
 
 
 def request_json(url: str, headers: dict[str, str], payload: dict | None, timeout: int) -> dict:
@@ -90,15 +142,24 @@ def check_model(base_url: str, api_key: str, model: str, protocol: str, timeout:
 
 
 def generate_openai(base_url: str, api_key: str, args: argparse.Namespace) -> tuple[bytes, str]:
-    payload = {"model": args.model, "prompt": args.prompt, "n": 1}
-    if args.size:
-        payload["size"] = args.size
-    result = request_json(
-        f"{base_url}/v1/images/generations",
-        {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-        payload,
-        args.timeout,
-    )
+    if args.input_image_bytes is not None:
+        fields = {"model": args.model, "prompt": args.prompt, "n": "1"}
+        if args.size:
+            fields["size"] = args.size
+        body, boundary = multipart_body(
+            fields, args.input_image_path.name, args.input_image_bytes, args.input_image_mime
+        )
+        result = request_multipart(f"{base_url}/v1/images/edits", api_key, body, boundary, args.timeout)
+    else:
+        payload = {"model": args.model, "prompt": args.prompt, "n": 1}
+        if args.size:
+            payload["size"] = args.size
+        result = request_json(
+            f"{base_url}/v1/images/generations",
+            {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+            payload,
+            args.timeout,
+        )
     items = result.get("data") or []
     if not items:
         raise RuntimeError("OpenAI-compatible response did not contain data[0]")
@@ -123,8 +184,16 @@ def generate_openai(base_url: str, api_key: str, args: argparse.Namespace) -> tu
 
 
 def generate_gemini(base_url: str, api_key: str, args: argparse.Namespace) -> tuple[bytes, str]:
+    request_parts = [{"text": args.prompt}]
+    if args.input_image_bytes is not None:
+        request_parts.append({
+            "inlineData": {
+                "mimeType": args.input_image_mime,
+                "data": base64.b64encode(args.input_image_bytes).decode("ascii"),
+            }
+        })
     payload = {
-        "contents": [{"role": "user", "parts": [{"text": args.prompt}]}],
+        "contents": [{"role": "user", "parts": request_parts}],
         "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
     }
     result = request_json(
@@ -148,6 +217,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocol", choices=("auto", "openai", "gemini"), default="auto")
     parser.add_argument("--prompt", help="Image prompt. Required unless --check or --list-models is used.")
     parser.add_argument("--output", default="generated.png", help="Output image path.")
+    parser.add_argument("--input-image", help="PNG, JPEG, or WebP source image for image-to-image editing.")
     parser.add_argument("--size", help="OpenAI-compatible size, for example 1024x1024.")
     parser.add_argument("--base-url", default=os.environ.get("KLONG_BASE_URL", "https://api.klong.lat"))
     parser.add_argument("--timeout", type=int, default=240)
@@ -178,6 +248,23 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"{args.model} only supports --concurrency 1")
     if args.protocol == "gemini" and args.size:
         parser.error("--size is only supported for OpenAI-compatible models")
+    args.input_image_path = None
+    args.input_image_bytes = None
+    args.input_image_mime = None
+    if args.input_image:
+        path = Path(args.input_image).expanduser().resolve()
+        if not path.is_file():
+            parser.error(f"--input-image does not exist or is not a file: {path}")
+        if path.stat().st_size > MAX_INPUT_BYTES:
+            parser.error(f"--input-image must not exceed {MAX_INPUT_BYTES // (1024 * 1024)} MiB")
+        try:
+            content = path.read_bytes()
+            mime_type = input_image_mime(content)
+        except (OSError, RuntimeError) as exc:
+            parser.error(str(exc))
+        args.input_image_path = path
+        args.input_image_bytes = content
+        args.input_image_mime = mime_type
     return args
 
 

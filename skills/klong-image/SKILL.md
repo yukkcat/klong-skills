@@ -1,6 +1,6 @@
 ---
 name: klong-image
-description: Generate single images or controlled concurrent image batches through the third-party Klong API using its OpenAI-compatible GPT image models or native Gemini image models. Use when the user asks Codex to draw, generate one or more images, create visual assets, compare Klong image models, or save generated raster images locally.
+description: Generate or edit single images and controlled concurrent image batches through the third-party Klong API using its OpenAI-compatible GPT image models or native Gemini image models. Use when the user asks Codex to draw, generate one or more images, perform image-to-image editing, create variants from a source image, create visual assets, compare Klong image models, or save generated raster images locally.
 ---
 
 # Klong Image
@@ -12,14 +12,27 @@ Use `scripts/generate.py` for deterministic API calls. Never put an API key in a
 1. Confirm `KLONG_API_KEY` exists in the process environment.
 2. If current availability matters, run `--list-models`. Choose `gpt-image-2` by default, or `gemini-3.1-flash-image-preview` when native Gemini is requested.
 3. Pick an output path inside the current workspace. Create its parent directory when needed.
-4. Run:
+4. For image-to-image work, identify the source PNG, JPEG, or WebP file and pass it with `--input-image`.
+5. Run:
 
 ```shell
 python <skill-dir>/scripts/generate.py --model <model> --prompt "<prompt>" --output <path>
 ```
 
-5. Verify that the output file exists and is non-empty. When visual inspection tools are available, inspect the image before reporting completion.
-6. Report the selected model, protocol, and absolute output path. Do not report the secret or raw Base64 payload.
+6. Verify that the output file exists and is non-empty. When visual inspection tools are available, inspect the image before reporting completion.
+7. Report the selected model, protocol, and absolute output path. Do not report the secret or raw Base64 payload.
+
+## Image-to-Image Editing
+
+Edit an existing image:
+
+```shell
+python <skill-dir>/scripts/generate.py --model gpt-image-2-c --input-image source.png --prompt "Keep the subject and change the background to a snowy mountain" --output edited.png
+```
+
+OpenAI-compatible models send multipart requests to `/v1/images/edits`. Gemini models send the source image as `inlineData` alongside the prompt. Input images must be PNG, JPEG, or WebP and no larger than 20 MiB.
+
+Use `--count` and `--concurrency` to create multiple variants from the same source image. Each request receives the original source image; outputs are not chained into later requests.
 
 ## Batch Generation
 
@@ -68,7 +81,7 @@ Set an explicit OpenAI-compatible size:
 python <skill-dir>/scripts/generate.py --model gpt-image-2 --size 1024x1024 --prompt "A red paper lantern on white" --output lantern.png
 ```
 
-For Gemini models, omit `--size`; the script sends the native `generateContent` request and extracts `inlineData`.
+For Gemini models, omit `--size`; the script sends the native `generateContent` request and extracts `inlineData`. This applies to both text-to-image and image-to-image requests.
 
 ## Failures
 

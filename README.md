@@ -2,11 +2,12 @@
 
 小恐龙 API 的 Codex Skills 集合。安装后，可直接让 Codex 调用小恐龙 API 完成图片生成和批量出图，无需在对话中传递 API Key。
 
-当前提供 `klong-image`：兼容 OpenAI Images 协议与 Gemini 原生图片协议，支持模型发现、并发生成、失败重试和本地文件输出。
+当前提供 `klong-image`：兼容 OpenAI Images 协议与 Gemini 原生图片协议，支持文生图、图生图、模型发现、并发生成、失败重试和本地文件输出。
 
 ## 功能
 
 - 在 Codex 对话中直接生成图片
+- 使用已有图片生成修改版本或多个变体
 - 自动选择 OpenAI 或 Gemini 请求协议
 - 通过 `/v1/models` 查询当前 Key 可用的模型
 - 单次生成 1-100 张图片
@@ -85,6 +86,14 @@ export KLONG_API_KEY="sk-替换成你的密钥"
 
 批量文件会自动编号为 `product-001.png`、`product-002.png`，依次类推。
 
+图生图：
+
+```text
+使用 $klong-image，以 assets/source.png 为输入，保持主体不变，把背景改成雪山，保存到 outputs/edited.png。
+```
+
+图生图支持 PNG、JPEG 和 WebP，输入文件最大 20 MiB。OpenAI 兼容模型使用 `/v1/images/edits`，Gemini 模型会把图片作为 `inlineData` 与提示词一起发送。
+
 ## 模型与协议
 
 | 模型 | 协议 | 并发建议 |
@@ -118,12 +127,23 @@ python .\skills\klong-image\scripts\generate.py `
   --concurrency 2
 ```
 
+直接执行图生图：
+
+```powershell
+python .\skills\klong-image\scripts\generate.py `
+  --model gpt-image-2-c `
+  --input-image assets\source.png `
+  --prompt "保持主体不变，把背景改成雪山" `
+  --output outputs\edited.png
+```
+
 常用参数：
 
 | 参数 | 默认值 | 说明 |
 | --- | --- | --- |
 | `--model` | `gpt-image-2` | 模型 ID |
 | `--protocol` | `auto` | `auto`、`openai` 或 `gemini` |
+| `--input-image` | 无 | 图生图源文件，支持 PNG、JPEG、WebP，最大 20 MiB |
 | `--count` | `1` | 生成数量，范围 1-100 |
 | `--concurrency` | `1` | 并发请求数，至少为 1，实际不会超过生成数量 |
 | `--timeout` | `240` | 单次请求超时秒数 |
