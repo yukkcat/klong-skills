@@ -9,7 +9,9 @@ import json
 import os
 import random
 import secrets
+import struct
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -39,6 +41,89 @@ class TransientError(RuntimeError):
     """A temporary upstream failure that may succeed when retried."""
 
 
+class ImageTaskError(RuntimeError):
+    def __init__(self, message: str, attempts: int, duration_seconds: float):
+        super().__init__(message)
+        self.attempts = attempts
+        self.duration_seconds = duration_seconds
+
+
+class ProgressReporter:
+    def __init__(self, enabled: bool, total: int, interval: int = 30):
+        self.enabled = enabled
+        self.total = total
+        self.interval = interval
+        self.started_at = time.monotonic()
+        self.active = set()
+        self.succeeded = 0
+        self.failed = 0
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def emit(self, message: str) -> None:
+        if self.enabled:
+            print(message, file=sys.stderr, flush=True)
+
+    def start(self, model: str, protocol: str, mode: str, concurrency: int, timeout: int) -> None:
+        self.emit(
+            f"[start] model={model} protocol={protocol} mode={mode} "
+            f"requests={self.total} concurrency={min(concurrency, self.total)} timeout={timeout}s"
+        )
+        if self.enabled:
+            self.thread = threading.Thread(target=self._heartbeat, daemon=True)
+            self.thread.start()
+
+    def _heartbeat(self) -> None:
+        while not self.stop_event.wait(self.interval):
+            with self.lock:
+                active = len(self.active)
+                succeeded = self.succeeded
+                failed = self.failed
+                completed = succeeded + failed
+            elapsed = time.monotonic() - self.started_at
+            self.emit(
+                f"[waiting] elapsed={elapsed:.1f}s active={active} "
+                f"completed={completed}/{self.total} succeeded={succeeded} failed={failed}"
+            )
+
+    def request_started(self, index: int) -> None:
+        with self.lock:
+            self.active.add(index)
+        self.emit(f"[request {index}/{self.total}] started")
+
+    def retry(self, index: int, attempt: int, delay: float, error: Exception) -> None:
+        self.emit(
+            f"[request {index}/{self.total}] retry={attempt} delay={delay:.1f}s reason={error}"
+        )
+
+    def request_completed(self, index: int, duration: float, size: int, width: int | None, height: int | None) -> None:
+        with self.lock:
+            self.active.discard(index)
+            self.succeeded += 1
+        dimensions = f"{width}x{height}" if width and height else "unknown"
+        self.emit(
+            f"[request {index}/{self.total}] completed duration={duration:.1f}s "
+            f"size={size / (1024 * 1024):.2f}MiB dimensions={dimensions}"
+        )
+
+    def request_failed(self, index: int, duration: float, error: Exception) -> None:
+        with self.lock:
+            self.active.discard(index)
+            self.failed += 1
+        self.emit(f"[request {index}/{self.total}] failed duration={duration:.1f}s reason={error}")
+
+    def complete(self) -> None:
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join()
+        elapsed = time.monotonic() - self.started_at
+        self.emit(
+            f"[complete] duration={elapsed:.1f}s requested={self.total} "
+            f"succeeded={self.succeeded} failed={self.failed}"
+        )
+
+
 def read_limited(stream: BinaryIO, limit: int = MAX_RESPONSE_BYTES) -> bytes:
     content = stream.read(limit + 1)
     if len(content) > limit:
@@ -66,6 +151,38 @@ def input_image_mime(content: bytes) -> str:
     if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
         return "image/webp"
     raise RuntimeError("Input image must be PNG, JPEG, or WebP")
+
+
+def image_dimensions(content: bytes) -> tuple[int | None, int | None]:
+    if content.startswith(b"\x89PNG\r\n\x1a\n") and len(content) >= 24:
+        return struct.unpack(">II", content[16:24])
+    if content.startswith((b"GIF87a", b"GIF89a")) and len(content) >= 10:
+        return struct.unpack("<HH", content[6:10])
+    if content.startswith(b"\xff\xd8"):
+        offset = 2
+        start_of_frame = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+        while offset + 9 <= len(content):
+            if content[offset] != 0xFF:
+                offset += 1
+                continue
+            marker = content[offset + 1]
+            if marker in start_of_frame:
+                height, width = struct.unpack(">HH", content[offset + 5:offset + 9])
+                return width, height
+            if marker in {0xD8, 0xD9}:
+                offset += 2
+                continue
+            if offset + 4 > len(content):
+                break
+            segment_length = struct.unpack(">H", content[offset + 2:offset + 4])[0]
+            if segment_length < 2:
+                break
+            offset += 2 + segment_length
+    if len(content) >= 30 and content[:4] == b"RIFF" and content[8:16] == b"WEBPVP8X":
+        width = int.from_bytes(content[24:27], "little") + 1
+        height = int.from_bytes(content[27:30], "little") + 1
+        return width, height
+    return None, None
 
 
 def multipart_body(fields: dict[str, str], filename: str, content: bytes, mime_type: str) -> tuple[bytes, str]:
@@ -220,13 +337,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-image", help="PNG, JPEG, or WebP source image for image-to-image editing.")
     parser.add_argument("--size", help="OpenAI-compatible size, for example 1024x1024.")
     parser.add_argument("--base-url", default=os.environ.get("KLONG_BASE_URL", "https://api.klong.lat"))
-    parser.add_argument("--timeout", type=int, default=240)
+    parser.add_argument("--timeout", type=int, help="Request timeout in seconds. Defaults to 420 for 4K models, otherwise 360.")
     parser.add_argument("--count", type=int, default=1, help="Number of images to generate (1-100).")
     parser.add_argument("--concurrency", type=int, default=1, help="Parallel requests (at least 1; effective maximum is --count).")
     parser.add_argument("--retries", type=int, default=2, help="Retries after a transient failure (0-5).")
     parser.add_argument("--retry-delay", type=float, default=3, help="Initial retry delay in seconds (0-60).")
     parser.add_argument("--check", action="store_true", help="Check model access without generating an image.")
     parser.add_argument("--list-models", action="store_true", help="List model IDs visible to the current key.")
+    parser.add_argument("--no-progress", action="store_true", help="Suppress human-readable progress on stderr.")
     args = parser.parse_args()
     if args.list_models and (args.check or args.prompt):
         parser.error("--list-models cannot be combined with --check or --prompt")
@@ -240,6 +358,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--retry-delay must be between 0 and 60")
     if not args.list_models and not args.model:
         args.model = DEFAULT_OPENAI_MODEL
+    if args.timeout is None:
+        args.timeout = 420 if "4k" in (args.model or "").lower() else 360
     if not args.list_models and not args.check and not args.prompt:
         parser.error("--prompt is required unless --check or --list-models is used")
     if args.protocol == "auto":
@@ -284,27 +404,54 @@ def main() -> int:
             return 0
         output = Path(args.output).expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
+        mode = "image-to-image" if args.input_image_bytes is not None else "text-to-image"
+        progress = ProgressReporter(not args.no_progress, args.count)
+        progress.start(args.model, args.protocol, mode, args.concurrency, args.timeout)
 
         def generate_one(index: int) -> dict:
-            for attempt in range(args.retries + 1):
-                try:
-                    image_bytes, mime_type = (
-                        generate_gemini(base_url, api_key, args)
-                        if args.protocol == "gemini"
-                        else generate_openai(base_url, api_key, args)
-                    )
-                    break
-                except (TransientError, TimeoutError) as exc:
-                    if attempt >= args.retries:
-                        raise RuntimeError(f"Image {index} failed after {attempt + 1} attempts: {exc}") from exc
-                    delay = args.retry_delay * (2**attempt)
-                    time.sleep(delay + random.uniform(0, min(1, delay * 0.1)))
-            if not image_bytes:
-                raise RuntimeError("The API returned an empty image")
-            validate_image(image_bytes)
-            item_output = output if args.count == 1 else output.with_name(f"{output.stem}-{index:03d}{output.suffix}")
-            item_output.write_bytes(image_bytes)
-            return {"index": index, "bytes": len(image_bytes), "mime_type": mime_type, "output": str(item_output)}
+            request_started_at = time.monotonic()
+            attempts = 0
+            progress.request_started(index)
+            try:
+                for attempt in range(args.retries + 1):
+                    attempts = attempt + 1
+                    try:
+                        image_bytes, mime_type = (
+                            generate_gemini(base_url, api_key, args)
+                            if args.protocol == "gemini"
+                            else generate_openai(base_url, api_key, args)
+                        )
+                        break
+                    except (TransientError, TimeoutError) as exc:
+                        if attempt >= args.retries:
+                            raise RuntimeError(
+                                f"Image {index} failed after {attempt + 1} attempts: {exc}"
+                            ) from exc
+                        delay = args.retry_delay * (2**attempt)
+                        progress.retry(index, attempt + 2, delay, exc)
+                        time.sleep(delay + random.uniform(0, min(1, delay * 0.1)))
+                if not image_bytes:
+                    raise RuntimeError("The API returned an empty image")
+                validate_image(image_bytes)
+                width, height = image_dimensions(image_bytes)
+                item_output = output if args.count == 1 else output.with_name(f"{output.stem}-{index:03d}{output.suffix}")
+                item_output.write_bytes(image_bytes)
+                duration = time.monotonic() - request_started_at
+                progress.request_completed(index, duration, len(image_bytes), width, height)
+                return {
+                    "index": index,
+                    "bytes": len(image_bytes),
+                    "mime_type": mime_type,
+                    "width": width,
+                    "height": height,
+                    "attempts": attempts,
+                    "duration_seconds": round(duration, 3),
+                    "output": str(item_output),
+                }
+            except (RuntimeError, ValueError, OSError) as exc:
+                duration = time.monotonic() - request_started_at
+                progress.request_failed(index, duration, exc)
+                raise ImageTaskError(str(exc), attempts, duration) from exc
 
         results = []
         failures = []
@@ -314,16 +461,26 @@ def main() -> int:
                 index = futures[future]
                 try:
                     results.append(future.result())
-                except (RuntimeError, ValueError, OSError) as exc:
-                    failures.append({"index": index, "error": str(exc)})
+                except ImageTaskError as exc:
+                    failures.append({
+                        "index": index,
+                        "attempts": exc.attempts,
+                        "duration_seconds": round(exc.duration_seconds, 3),
+                        "error": str(exc),
+                    })
         results.sort(key=lambda item: item["index"])
         failures.sort(key=lambda item: item["index"])
+        progress.complete()
+        total_duration = time.monotonic() - progress.started_at
         print(json.dumps({
             "model": args.model,
             "protocol": args.protocol,
+            "mode": mode,
             "requested": args.count,
+            "concurrency": min(args.concurrency, args.count),
             "succeeded": len(results),
             "failed": len(failures),
+            "duration_seconds": round(total_duration, 3),
             "images": results,
             "failures": failures,
         }, ensure_ascii=False))

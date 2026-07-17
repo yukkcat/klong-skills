@@ -13,6 +13,8 @@
 - 单次生成 1-100 张图片
 - 并发数由用户按任务和账户能力设置
 - 对 `429`、`5xx`、网络错误和超时进行指数退避重试
+- 实时显示请求、等待、重试、成功和失败状态
+- 输出包含耗时、实际分辨率和文件大小的 JSON 汇总
 - 校验响应大小和图片格式，拒绝异常内容
 - API Key 仅从本地环境变量读取
 
@@ -146,13 +148,34 @@ python .\skills\klong-image\scripts\generate.py `
 | `--input-image` | 无 | 图生图源文件，支持 PNG、JPEG、WebP，最大 20 MiB |
 | `--count` | `1` | 生成数量，范围 1-100 |
 | `--concurrency` | `1` | 并发请求数，至少为 1，实际不会超过生成数量 |
-| `--timeout` | `240` | 单次请求超时秒数 |
+| `--timeout` | 自动 | 普通模型默认 360 秒，名称含 `4k` 的模型默认 420 秒 |
 | `--retries` | `2` | 临时错误重试次数，范围 0-5 |
 | `--retry-delay` | `3` | 首次重试等待秒数，范围 0-60 |
 | `--check` | 关闭 | 只检查指定模型是否可用 |
 | `--list-models` | 关闭 | 列出当前 Key 可见的模型 |
+| `--no-progress` | 关闭 | 关闭 stderr 中的人类可读实时状态 |
 
-脚本完成后输出 JSON 汇总，包括请求数、成功数、失败数、文件路径和失败索引。只要有一张失败，进程退出码即为 `1`，已经成功的文件会保留。
+## 运行状态与结果
+
+生成过程中，脚本会在 stderr 实时输出请求开始、重试、完成和失败状态。超过 30 秒的任务会定期显示真实等待时间：
+
+```text
+[start] model=gpt-image-2-vip protocol=openai mode=text-to-image requests=4 concurrency=2 timeout=360s
+[request 1/4] started
+[waiting] elapsed=30.0s active=2 completed=0/4 succeeded=0 failed=0
+[request 1/4] completed duration=91.2s size=14.40MiB dimensions=3840x2160
+[complete] duration=143.8s requested=4 succeeded=3 failed=1
+```
+
+API 不提供真实生成百分比，因此脚本只报告可验证的状态和已用时间，不显示虚假进度条。
+
+脚本完成后在 stdout 输出 JSON 汇总，包括模式、总耗时、请求数、成功数、失败数，以及每张图片的耗时、尝试次数、实际分辨率、文件大小、路径或错误。只要有一张失败，进程退出码即为 `1`，已经成功的文件会保留。
+
+Codex 会把结果整理成便于阅读的表格：
+
+| 序号 | 状态 | 耗时 | 实际分辨率 | 大小 | 尝试次数 | 文件或错误 |
+| --- | --- | ---: | --- | ---: | ---: | --- |
+| 1 | 成功 | 91.2s | 3840x2160 | 14.4 MiB | 1 | `outputs/image-001.png` |
 
 ## 并发与重试
 
