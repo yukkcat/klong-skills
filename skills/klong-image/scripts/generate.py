@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate an image through the Klong OpenAI-compatible or Gemini API."""
+"""Generate an image through the 小恐龙 OpenAI-compatible or Gemini API."""
 
 from __future__ import annotations
 
@@ -16,8 +16,12 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from typing import BinaryIO
+
+from connection_store import resolve_cli_connection, resolve_output_directory, validate_base_url
+from generation_manifest import now_iso, record_generation_manifest, validate_job_id
 
 
 OPENAI_MODELS = {
@@ -35,6 +39,7 @@ MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_INPUT_BYTES = 20 * 1024 * 1024
 USER_AGENT = "klong-image-skill/0.1"
 SERIAL_MODELS = {"gpt-image-2-codex", "gpt-image-2-vip"}
+DEFAULT_OUTPUT_DIR = Path(resolve_output_directory()["path"])
 
 
 class TransientError(RuntimeError):
@@ -57,11 +62,14 @@ class ProgressReporter:
         self.active = set()
         self.succeeded = 0
         self.failed = 0
+        self.messages = []
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.thread = None
 
     def emit(self, message: str) -> None:
+        with self.lock:
+            self.messages = (self.messages + [message])[-80:]
         if self.enabled:
             print(message, file=sys.stderr, flush=True)
 
@@ -333,10 +341,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", help=f"Model ID. Defaults to {DEFAULT_OPENAI_MODEL}.")
     parser.add_argument("--protocol", choices=("auto", "openai", "gemini"), default="auto")
     parser.add_argument("--prompt", help="Image prompt. Required unless --check or --list-models is used.")
-    parser.add_argument("--output", default="generated.png", help="Output image path.")
+    parser.add_argument(
+        "--output",
+        help="Output image path. Defaults to a unique PNG under the shared local gallery directory.",
+    )
+    parser.add_argument("--name", help="Task name shown in local studio history. Defaults to the output filename.")
+    parser.add_argument("--job-id", help="Stable task ID used by local studio history.")
+    parser.add_argument(
+        "--gallery-dir",
+        default=str(DEFAULT_OUTPUT_DIR),
+        help="Shared local gallery directory used for task history metadata.",
+    )
+    parser.add_argument("--no-history", action="store_true", help="Do not write local studio task history metadata.")
+    parser.add_argument("--connection-id", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--connection-name", default="", help=argparse.SUPPRESS)
     parser.add_argument("--input-image", help="PNG, JPEG, or WebP source image for image-to-image editing.")
     parser.add_argument("--size", help="OpenAI-compatible size, for example 1024x1024.")
-    parser.add_argument("--base-url", default=os.environ.get("KLONG_BASE_URL", "https://api.klong.lat"))
+    parser.add_argument("--base-url", help="Override the API base URL from the active connection.")
     parser.add_argument("--timeout", type=int, help="Request timeout in seconds. Defaults to 420 for 4K models, otherwise 360.")
     parser.add_argument("--count", type=int, default=1, help="Number of images to generate (1-100).")
     parser.add_argument("--concurrency", type=int, default=1, help="Parallel requests (at least 1; effective maximum is --count).")
@@ -346,6 +367,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--list-models", action="store_true", help="List model IDs visible to the current key.")
     parser.add_argument("--no-progress", action="store_true", help="Suppress human-readable progress on stderr.")
     args = parser.parse_args()
+    if not args.output:
+        filename = datetime.now().strftime("generated-%Y%m%d-%H%M%S-%f.png")
+        args.output = str(DEFAULT_OUTPUT_DIR / filename)
     if args.list_models and (args.check or args.prompt):
         parser.error("--list-models cannot be combined with --check or --prompt")
     if not 1 <= args.count <= 100:
@@ -356,18 +380,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("--retries must be between 0 and 5")
     if not 0 <= args.retry_delay <= 60:
         parser.error("--retry-delay must be between 0 and 60")
-    if not args.list_models and not args.model:
-        args.model = DEFAULT_OPENAI_MODEL
-    if args.timeout is None:
-        args.timeout = 420 if "4k" in (args.model or "").lower() else 360
     if not args.list_models and not args.check and not args.prompt:
         parser.error("--prompt is required unless --check or --list-models is used")
-    if args.protocol == "auto":
-        args.protocol = "gemini" if args.model in GEMINI_MODELS or (args.model or "").startswith("gemini-") else "openai"
-    if args.model in SERIAL_MODELS and args.concurrency != 1:
-        parser.error(f"{args.model} only supports --concurrency 1")
-    if args.protocol == "gemini" and args.size:
-        parser.error("--size is only supported for OpenAI-compatible models")
+    if args.job_id:
+        try:
+            args.job_id = validate_job_id(args.job_id)
+        except ValueError as exc:
+            parser.error(str(exc))
     args.input_image_path = None
     args.input_image_bytes = None
     args.input_image_mime = None
@@ -388,13 +407,37 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def configure_runtime(args: argparse.Namespace, connection: dict[str, str]) -> None:
+    args.model = args.model or connection.get("default_model") or DEFAULT_OPENAI_MODEL
+    args.base_url = validate_base_url(args.base_url or connection.get("base_url"))
+    args.connection_id = args.connection_id or connection.get("id") or ""
+    args.connection_name = args.connection_name or connection.get("name") or ""
+    if args.protocol == "auto":
+        args.protocol = "gemini" if args.model in GEMINI_MODELS or args.model.startswith("gemini-") else "openai"
+    if args.timeout is None:
+        args.timeout = 420 if "4k" in args.model.lower() else 360
+    if args.model in SERIAL_MODELS and args.concurrency != 1:
+        raise ValueError(f"{args.model} only supports --concurrency 1")
+    if args.protocol == "gemini" and args.size:
+        raise ValueError("--size is only supported for OpenAI-compatible models")
+
+
 def main() -> int:
     args = parse_args()
-    api_key = os.environ.get("KLONG_API_KEY")
-    if not api_key:
-        print("KLONG_API_KEY is not set", file=sys.stderr)
+    try:
+        connection = resolve_cli_connection(
+            process_connection_id=args.connection_id,
+            process_connection_name=args.connection_name,
+        )
+        configure_runtime(args, connection)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
         return 2
+    api_key = connection["api_key"]
     base_url = args.base_url.rstrip("/")
+    persist_history = None
+    progress = None
+    job_context = None
     try:
         if args.list_models:
             print(json.dumps({"models": list_models(base_url, api_key, args.timeout)}, ensure_ascii=False))
@@ -403,10 +446,64 @@ def main() -> int:
             check_model(base_url, api_key, args.model, args.protocol, args.timeout)
             return 0
         output = Path(args.output).expanduser().resolve()
+        gallery_dir = Path(args.gallery_dir).expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
         mode = "image-to-image" if args.input_image_bytes is not None else "text-to-image"
+        job_id = args.job_id or f"codex-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3)}"
+        job_name = str(args.name or output.stem).strip()[:120] or output.stem
+        created_at = now_iso()
+        started_at = now_iso()
         progress = ProgressReporter(not args.no_progress, args.count)
         progress.start(args.model, args.protocol, mode, args.concurrency, args.timeout)
+        history_manifest = None
+        history_enabled = not args.no_history
+        if history_enabled:
+            try:
+                output.relative_to(gallery_dir)
+            except ValueError:
+                history_enabled = False
+                progress.emit(f"[history] skipped because output is outside gallery directory: {gallery_dir}")
+
+        manifest_payload = {
+            "prompt": args.prompt,
+            "protocol": args.protocol,
+            "mode": mode,
+            "size": args.size or "",
+        }
+
+        job_context = {
+            "id": job_id,
+            "name": job_name,
+            "created_at": created_at,
+            "started_at": started_at,
+            "prompt": args.prompt,
+            "model": args.model,
+            "connection_id": args.connection_id,
+            "connection_name": args.connection_name,
+            "protocol": args.protocol,
+            "size": args.size or "",
+            "count": args.count,
+            "concurrency": min(args.concurrency, args.count),
+        }
+
+        def persist_history(status: str, result: dict, error: str = "", completed_at: str = "") -> None:
+            nonlocal history_manifest
+            if not history_enabled:
+                return
+            job = {
+                **job_context,
+                "status": status,
+                "completed_at": completed_at,
+                "progress": list(progress.messages),
+                "error": error,
+            }
+            try:
+                _, target = record_generation_manifest(gallery_dir, job, manifest_payload, result)
+                history_manifest = str(target)
+            except (OSError, TypeError, ValueError) as exc:
+                progress.emit(f"[history] failed to write task metadata: {exc}")
+
+        persist_history("running", {})
 
         def generate_one(index: int) -> dict:
             request_started_at = time.monotonic()
@@ -472,7 +569,9 @@ def main() -> int:
         failures.sort(key=lambda item: item["index"])
         progress.complete()
         total_duration = time.monotonic() - progress.started_at
-        print(json.dumps({
+        completed_at = now_iso()
+        status = "failed" if failures else "completed"
+        result = {
             "model": args.model,
             "protocol": args.protocol,
             "mode": mode,
@@ -483,9 +582,45 @@ def main() -> int:
             "duration_seconds": round(total_duration, 3),
             "images": results,
             "failures": failures,
+        }
+        error = "; ".join(str(item.get("error") or "") for item in failures if item.get("error"))
+        persist_history(status, result, error, completed_at)
+        print(json.dumps({
+            **job_context,
+            "status": status,
+            "completed_at": completed_at,
+            "progress": list(progress.messages),
+            "error": error,
+            "history_manifest": history_manifest,
+            "result": result,
         }, ensure_ascii=False))
         return 1 if failures else 0
     except (RuntimeError, ValueError, OSError) as exc:
+        if persist_history is not None and progress is not None and job_context is not None:
+            completed_at = now_iso()
+            duration = round(max(0.0, time.monotonic() - progress.started_at), 3)
+            result = {
+                "model": job_context["model"],
+                "protocol": job_context["protocol"],
+                "mode": "image-to-image" if args.input_image_bytes is not None else "text-to-image",
+                "requested": job_context["count"],
+                "concurrency": job_context["concurrency"],
+                "succeeded": 0,
+                "failed": job_context["count"],
+                "duration_seconds": duration,
+                "images": [],
+                "failures": [{"error": str(exc)}],
+            }
+            persist_history("failed", result, str(exc), completed_at)
+            print(json.dumps({
+                **job_context,
+                "status": "failed",
+                "completed_at": completed_at,
+                "progress": list(progress.messages),
+                "error": str(exc),
+                "history_manifest": history_manifest,
+                "result": result,
+            }, ensure_ascii=False))
         print(str(exc), file=sys.stderr)
         return 1
 
