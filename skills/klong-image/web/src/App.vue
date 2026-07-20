@@ -3,7 +3,7 @@
     <aside class="library-sidebar" aria-label="提示词库导航">
       <div class="brand-lockup">
         <span class="brand-mark">小</span>
-        <span class="brand-copy"><strong>小恐龙</strong><small>图像创作工作台</small></span>
+        <span class="brand-copy"><strong>小恐龙</strong><small>图像创作工作台 <span class="app-version">v{{ appVersion }}</span></small></span>
         <a
           class="github-link"
           href="https://github.com/yukkcat/klong-skills"
@@ -86,7 +86,7 @@
         </section>
       </nav>
 
-      <nav v-else class="sidebar-navigation creation-navigation">
+      <nav v-else-if="activeView === 'create'" class="sidebar-navigation creation-navigation">
         <section class="nav-section browse-section">
           <button
             class="nav-home"
@@ -105,32 +105,54 @@
             <small>{{ historyTotal }}</small>
           </div>
           <div v-if="jobHistory.length" class="creation-history-list">
-            <button
+            <article
               v-for="item in jobHistory"
               :key="item.id"
               class="creation-history-item"
               :class="[{ active: job?.id === item.id }, `status-${item.status}`]"
-              type="button"
-              :title="historyItemTitle(item)"
-              :aria-current="job?.id === item.id ? 'true' : undefined"
-              @click="restoreHistoryJob(item)"
             >
-              <span class="creation-history-media">
-                <img v-if="item.thumbnail_url" :src="item.thumbnail_url" alt="" />
-                <Icon v-else :icon="item.status === 'failed' ? 'lucide:image-off' : 'lucide:image'" />
-                <span class="creation-history-status"><Icon :icon="historyStatusIcon(item.status)" /></span>
-              </span>
-              <span class="creation-history-copy">
-                <strong>{{ historyItemTitle(item) }}</strong>
-                <small><span>{{ item.model }}</span><span>{{ item.count }} 张</span><time>{{ formatDate(item.created_at) }}</time></small>
-              </span>
-            </button>
+              <button
+                class="creation-history-open"
+                type="button"
+                :title="historyItemTitle(item)"
+                :aria-current="job?.id === item.id ? 'true' : undefined"
+                @click="restoreHistoryJob(item)"
+              >
+                <span class="creation-history-media">
+                  <img v-if="item.thumbnail_url" :src="item.thumbnail_url" alt="" />
+                  <Icon v-else :icon="item.status === 'failed' ? 'lucide:image-off' : 'lucide:image'" />
+                  <span class="creation-history-status"><Icon :icon="historyStatusIcon(item.status)" /></span>
+                </span>
+                <span class="creation-history-copy">
+                  <strong>{{ historyItemTitle(item) }}</strong>
+                  <small><span>{{ item.model }}</span><span>{{ item.count }} 张</span><time>{{ formatDate(item.created_at) }}</time></small>
+                </span>
+              </button>
+              <Button
+                size="xs"
+                variant="ghost"
+                icon-only
+                root-class="creation-history-delete"
+                :title="['queued', 'running'].includes(item.status) ? '生成结束后可删除' : '删除生成记录'"
+                :disabled="['queued', 'running'].includes(item.status) || deletingHistoryIds.has(item.id)"
+                @click="deleteHistoryJob(item)"
+              >
+                <Icon :icon="deletingHistoryIds.has(item.id) ? 'lucide:loader-circle' : 'lucide:trash-2'" :class="{ spin: deletingHistoryIds.has(item.id) }" />
+              </Button>
+            </article>
           </div>
           <div v-else class="creation-history-empty">
             <Icon icon="lucide:history" />
             <span>生成记录会保留在这里</span>
           </div>
         </section>
+      </nav>
+
+      <nav v-else class="sidebar-navigation guide-navigation" aria-label="指南章节">
+        <button type="button" @click="scrollGuideTo('guide-install')"><Icon icon="lucide:download" /><span>安装 Skill</span><small>01</small></button>
+        <button type="button" @click="scrollGuideTo('guide-launch')"><Icon icon="lucide:panel-top-open" /><span>启动工作台</span><small>02</small></button>
+        <button type="button" @click="scrollGuideTo('guide-connect')"><Icon icon="lucide:key-round" /><span>配置连接</span><small>03</small></button>
+        <button type="button" @click="scrollGuideTo('guide-use')"><Icon icon="lucide:sparkles" /><span>开始使用</span><small>04</small></button>
       </nav>
 
       <div v-if="activeView === 'prompts'" class="sidebar-status">
@@ -172,7 +194,7 @@
           <button type="button" :class="{ active: activeView === 'gallery' }" title="图库" @click="switchView('gallery')"><Icon icon="lucide:images" /></button>
         </div>
 
-        <div v-if="activeView !== 'create'" class="search-field">
+        <div v-if="activeView === 'prompts' || activeView === 'gallery'" class="search-field">
           <Icon icon="lucide:search" />
           <Input
             v-model="activeSearch"
@@ -222,6 +244,16 @@
         <Button
           size="md"
           variant="outline"
+          :root-class="activeView === 'guide' ? 'header-guide-button active' : 'header-guide-button'"
+          title="安装与使用指南"
+          @click="switchView('guide')"
+        >
+          <Icon icon="lucide:book-open" />
+          <span>指南</span>
+        </Button>
+        <Button
+          size="md"
+          variant="outline"
           icon-only
           root-class="theme-toggle"
           :title="colorTheme === 'dark' ? '切换到亮色主题' : '切换到暗色主题'"
@@ -249,7 +281,8 @@
         :class="{
           'gallery-content': activeView === 'gallery',
           'gallery-has-selection': activeView === 'gallery' && gallerySelectionCount,
-          'creation-content': activeView === 'create'
+          'creation-content': activeView === 'create',
+          'guide-content': activeView === 'guide'
         }"
       >
         <template v-if="activeView === 'prompts'">
@@ -529,7 +562,7 @@
           </section>
         </template>
 
-        <template v-else>
+        <template v-else-if="activeView === 'gallery'">
           <section class="gallery-toolbar" aria-label="图库工具栏">
             <label v-if="galleryItems.length" class="gallery-page-select">
               <input type="checkbox" :checked="galleryPageSelected" @change="toggleGalleryPage" />
@@ -668,6 +701,87 @@
               </Button>
             </div>
           </nav>
+        </template>
+
+        <template v-else>
+          <article class="guide-page">
+            <header class="guide-hero">
+              <div class="guide-hero-copy">
+                <span class="eyebrow">GETTING STARTED · v{{ appVersion }}</span>
+                <h1>安装与使用</h1>
+                <p>安装 Skill 后，可以在 Codex 中直接生成图片；启动本地工作台后，还能浏览提示词、管理连接和查看统一图库。</p>
+              </div>
+              <div class="guide-runtime" :class="`mode-${runtimeMode}`">
+                <span class="guide-runtime-icon"><Icon :icon="runtimeMode === 'browser' ? 'lucide:cloud' : 'lucide:monitor-check'" /></span>
+                <span><small>当前运行方式</small><strong>{{ runtimeMode === 'browser' ? '云端浏览器模式' : '本地 Skill 模式' }}</strong></span>
+                <p>{{ runtimeMode === 'browser' ? 'Key、图片和历史仅保存在当前浏览器。' : '网页与 Codex 共用连接、历史和本地图库。' }}</p>
+              </div>
+            </header>
+
+            <section id="guide-install" class="guide-section">
+              <header class="guide-section-heading">
+                <span class="guide-step">01</span>
+                <div><h2>安装 klong-image Skill</h2><p>最简单的方式是把下面的指令发给 Codex，让内置安装器从 GitHub 安装。</p></div>
+              </header>
+              <div class="guide-command">
+                <code>{{ installSkillPrompt }}</code>
+                <Button size="sm" variant="outline" @click="copyGuideText(installSkillPrompt, '安装指令')"><Icon icon="lucide:copy" />复制</Button>
+              </div>
+              <div class="guide-note"><Icon icon="lucide:rotate-cw" /><span>安装完成后，重新打开 Codex 或开始一个新任务，让 Codex 重新发现 Skill。</span></div>
+            </section>
+
+            <section id="guide-launch" class="guide-section">
+              <header class="guide-section-heading">
+                <span class="guide-step">02</span>
+                <div><h2>让 Codex 启动本地工作台</h2><p>把下面的指令发给 Codex，Skill 会启动本地服务并打开工作台，无需手动输入启动命令。</p></div>
+              </header>
+              <div class="guide-command">
+                <code>{{ openStudioPrompt }}</code>
+                <Button size="sm" variant="outline" @click="copyGuideText(openStudioPrompt, '启动指令')"><Icon icon="lucide:copy" />复制</Button>
+              </div>
+              <div class="guide-note"><Icon icon="lucide:info" /><span>普通用户不需要安装 Node.js，也不需要运行 <code>npm run dev</code>；该命令仅用于开发前端源码。</span></div>
+              <div class="guide-mode-compare">
+                <div><Icon icon="lucide:hard-drive" /><span><strong>本地工作台</strong><small>图片写入本地图库，Codex 直接生成的记录也会显示在这里。</small></span></div>
+                <div><Icon icon="lucide:globe-2" /><span><strong>在线工作台</strong><small>无需启动 Python；每位用户的数据隔离保存在自己的浏览器中。</small></span></div>
+              </div>
+            </section>
+
+            <section id="guide-connect" class="guide-section">
+              <header class="guide-section-heading">
+                <span class="guide-step">03</span>
+                <div><h2>创建 Key 并配置连接</h2><p>一个工作台可以保存多个连接，每个连接有独立的 API 地址、Key、模型列表和默认模型。</p></div>
+              </header>
+              <ol class="guide-checklist">
+                <li><span>1</span><p>前往小恐龙控制台创建 API Key。</p><a href="https://api.klong.lat/keys" target="_blank" rel="noreferrer">创建 Key<Icon icon="lucide:arrow-up-right" /></a></li>
+                <li><span>2</span><p>打开连接设置，填写名称、API 地址和 Key。</p><Button size="sm" variant="outline" @click="openConnection"><Icon icon="lucide:settings-2" />打开设置</Button></li>
+                <li><span>3</span><p>点击“测试并获取模型”，选择默认模型，然后保存并设为当前连接。</p></li>
+              </ol>
+              <div class="guide-security"><Icon icon="lucide:shield-check" /><p><strong>{{ runtimeMode === 'browser' ? '浏览器加密存储' : '本地安全存储' }}</strong><small>{{ runtimeMode === 'browser' ? 'Key 使用浏览器 Web Crypto 加密，Vercel 不接收也不保存；清除站点数据会一并清除。' : 'Windows 使用当前用户的 DPAPI 加密保存 Key；网页和 Codex 直调使用同一个当前连接。' }}</small></p></div>
+            </section>
+
+            <section id="guide-use" class="guide-section">
+              <header class="guide-section-heading">
+                <span class="guide-step">04</span>
+                <div><h2>开始创作</h2><p>提示词库、创作台和图库是一个连续流程；也可以直接在 Codex 对话中调用 Skill。</p></div>
+              </header>
+              <div class="guide-flow" aria-label="网页创作流程">
+                <div><span><Icon icon="lucide:library-big" /></span><strong>浏览提示词</strong><small>按词源、分类或关键词找到合适模板。</small></div>
+                <Icon class="guide-flow-arrow" icon="lucide:arrow-right" />
+                <div><span><Icon icon="lucide:wand-sparkles" /></span><strong>设置并生成</strong><small>选择连接、模型、数量、并发和参考图片。</small></div>
+                <Icon class="guide-flow-arrow" icon="lucide:arrow-right" />
+                <div><span><Icon icon="lucide:images" /></span><strong>进入图库</strong><small>查看大图、复制提示词、下载或批量管理。</small></div>
+              </div>
+              <div class="guide-command guide-codex-command">
+                <code>{{ codexExamplePrompt }}</code>
+                <Button size="sm" variant="outline" @click="copyGuideText(codexExamplePrompt, 'Codex 示例')"><Icon icon="lucide:copy" />复制示例</Button>
+              </div>
+            </section>
+
+            <footer class="guide-footer">
+              <span>小恐龙图像创作工作台 v{{ appVersion }}</span>
+              <a href="https://github.com/yukkcat/klong-skills" target="_blank" rel="noreferrer"><Icon icon="lucide:github" />查看源码与更新</a>
+            </footer>
+          </article>
         </template>
       </main>
     </section>
@@ -1103,6 +1217,39 @@
       </aside>
     </div>
 
+    <div v-if="confirmation" class="confirmation-layer" role="presentation" @mousedown.self="resolveConfirmation(false)">
+      <section
+        class="confirmation-dialog"
+        :class="`tone-${confirmation.tone}`"
+        role="alertdialog"
+        aria-modal="true"
+        aria-labelledby="confirmation-title"
+        aria-describedby="confirmation-message"
+      >
+        <header class="confirmation-header">
+          <span class="confirmation-icon"><Icon :icon="confirmation.tone === 'danger' ? 'lucide:triangle-alert' : 'lucide:circle-help'" /></span>
+          <Button size="sm" variant="ghost" icon-only root-class="confirmation-close" title="关闭" @click="resolveConfirmation(false)">
+            <Icon icon="lucide:x" />
+          </Button>
+        </header>
+        <div class="confirmation-copy">
+          <h2 id="confirmation-title">{{ confirmation.title }}</h2>
+          <p id="confirmation-message">{{ confirmation.message }}</p>
+        </div>
+        <footer class="confirmation-actions">
+          <Button size="md" variant="outline" @click="resolveConfirmation(false)">{{ confirmation.cancelLabel }}</Button>
+          <Button
+            size="md"
+            variant="primary"
+            :root-class="confirmation.tone === 'danger' ? 'confirmation-confirm danger' : 'confirmation-confirm'"
+            @click="resolveConfirmation(true)"
+          >
+            {{ confirmation.confirmLabel }}
+          </Button>
+        </footer>
+      </section>
+    </div>
+
     <Toast :toasts="toasts" @remove="removeToast" />
   </div>
 </template>
@@ -1112,6 +1259,7 @@ import { Icon } from '@iconify/vue'
 import { Button as NanocatButton, EmptyState, FilterSelect as NanocatFilterSelect, FormField, Input, MetaChip, Toast } from 'nanocat-ui'
 import type { SelectOption, ToastItem } from 'nanocat-ui'
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
+import packageInfo from '../package.json'
 import { createStudioRuntime, type RuntimeMode, type StudioRuntime } from './studioRuntime'
 
 // nanocat-ui 0.1.x accepts these runtime variants/emit shapes but its declarations are narrower.
@@ -1190,8 +1338,20 @@ type StorageStatus = {
 }
 type ToastTone = ToastItem['type']
 type GalleryAction = 'delete'
+type ConfirmationOptions = {
+  title: string
+  message: string
+  confirmLabel?: string
+  cancelLabel?: string
+  tone?: 'neutral' | 'danger'
+}
+type ConfirmationState = Required<ConfirmationOptions>
 
 const PAGE_SIZE = 24
+const appVersion = packageInfo.version
+const installSkillPrompt = '请从 https://github.com/yukkcat/klong-skills/tree/main/skills/klong-image 安装这个 Skill。'
+const openStudioPrompt = '使用 $klong-image 打开本地提示词工作台。'
+const codexExamplePrompt = '使用 $klong-image，通过 gpt-image-2 生成一张白底产品图，保存到 outputs/prompt-studio/product.png。'
 const token = document.querySelector<HTMLMetaElement>('meta[name="klong-token"]')?.content || ''
 const runtimeMode = ref<RuntimeMode>('local')
 let studioRuntime: StudioRuntime | null = null
@@ -1214,7 +1374,7 @@ const sourceDisplay: Record<string, { badge: string; name: string }> = {
 }
 
 const library = reactive<any>({ sources: [], syncing: true, prompt_count: 0, synced_at: '' })
-type WorkspaceView = 'prompts' | 'create' | 'gallery'
+type WorkspaceView = 'prompts' | 'create' | 'gallery' | 'guide'
 type ColorTheme = 'light' | 'dark'
 
 const themeStorageKey = 'klong-prompt-studio-theme'
@@ -1261,6 +1421,8 @@ const historyTotal = ref(0)
 const startedAt = ref(0)
 const elapsed = ref(0)
 const toasts = ref<ToastItem[]>([])
+const confirmation = ref<ConfirmationState | null>(null)
+const deletingHistoryIds = reactive(new Set<string>())
 const form = reactive<any>({ prompt: '', connection_id: '', model: 'gpt-image-2', size: '', filename: 'generated', count: 1, concurrency: 1 })
 const settingsStatus = reactive<any>({
   active_connection_id: '',
@@ -1297,6 +1459,7 @@ let libraryTimer: ReturnType<typeof setTimeout> | undefined
 let requestVersion = 0
 let galleryRequestVersion = 0
 let toastSequence = 0
+let confirmationResolver: ((confirmed: boolean) => void) | null = null
 const pollingJobIds = new Set<string>()
 
 const readySources = computed(() => library.sources.filter((source: any) => Number(source.count) > 0).length)
@@ -1353,16 +1516,23 @@ const activeSectionLabel = computed(() => {
   return '全部提示词'
 })
 const workspaceParentLabel = computed(() => (
-  activeView.value === 'prompts' ? '提示词库' : activeView.value === 'create' ? '图像创作' : '我的图库'
+  activeView.value === 'prompts' ? '提示词库'
+    : activeView.value === 'create' ? '图像创作'
+      : activeView.value === 'gallery' ? '我的图库'
+        : '帮助中心'
 ))
 const workspaceCurrentLabel = computed(() => {
   if (activeView.value === 'prompts') return activeSectionLabel.value
   if (activeView.value === 'gallery') return '全部作品'
+  if (activeView.value === 'guide') return '安装与使用'
   if (job.value) return historyItemTitle(summaryFromJob(job.value))
   return selected.value?.title || '新建创作'
 })
 const mobileViewLabel = computed(() => (
-  activeView.value === 'prompts' ? '提示词' : activeView.value === 'create' ? '创作' : '图库'
+  activeView.value === 'prompts' ? '提示词'
+    : activeView.value === 'create' ? '创作'
+      : activeView.value === 'gallery' ? '图库'
+        : '指南'
 ))
 const sourceOptions = computed<SelectOption[]>(() => [
   { label: '全部来源', value: 'all' },
@@ -1536,7 +1706,11 @@ async function chooseStorageFolder() {
 async function saveStorageFolder() {
   const nextPath = storageDraftPath.value.trim()
   if (!nextPath || !storageDirty.value) return
-  if (!window.confirm('切换图库位置后，原位置的作品不会自动移动。继续保存吗？')) return
+  if (!await requestConfirmation({
+    title: '切换图库位置？',
+    message: '原位置的作品不会自动移动，之后的新作品将保存到新位置。',
+    confirmLabel: '继续保存',
+  })) return
   try {
     storageBusy.value = true
     applyStorageStatus(await storageAction({ action: 'set', output_dir: nextPath }))
@@ -1550,7 +1724,11 @@ async function saveStorageFolder() {
 }
 
 async function resetStorageFolder() {
-  if (!window.confirm('恢复默认图库位置？原位置的作品不会自动移动。')) return
+  if (!await requestConfirmation({
+    title: '恢复默认图库位置？',
+    message: '原位置的作品不会自动移动，之后的新作品将保存到默认位置。',
+    confirmLabel: '恢复默认',
+  })) return
   try {
     storageBusy.value = true
     applyStorageStatus(await storageAction({ action: 'reset' }))
@@ -1587,7 +1765,12 @@ async function persistBrowserStorage() {
 }
 
 async function clearBrowserWorkspace() {
-  if (!window.confirm('永久删除此浏览器中的全部作品和生成历史？连接配置与 API Key 会保留。')) return
+  if (!await requestConfirmation({
+    title: '清空浏览器工作台？',
+    message: '全部作品和生成历史将永久删除，连接配置与 API Key 会保留。此操作无法撤销。',
+    confirmLabel: '永久清空',
+    tone: 'danger',
+  })) return
   try {
     storageBusy.value = true
     applyStorageStatus(await storageAction({ action: 'clear' }))
@@ -1696,7 +1879,12 @@ async function saveConnection() {
 async function deleteConnection() {
   const connection = editingConnection.value
   if (!connection || connection.readonly) return
-  if (!window.confirm(`永久删除连接“${connection.name}”？`)) return
+  if (!await requestConfirmation({
+    title: `删除“${connection.name}”？`,
+    message: '该连接及其保存的 API Key 将从当前工作台永久移除。',
+    confirmLabel: '删除连接',
+    tone: 'danger',
+  })) return
   try {
     savingConnection.value = true
     const data = await api(`/api/connections/${connection.id}/delete`, {
@@ -1780,6 +1968,7 @@ async function switchView(view: WorkspaceView) {
   if (view === 'create') await loadJobHistory(true)
   if (view === 'gallery' && !galleryItems.value.length && !loadingGallery.value) await resetGallery()
   await nextTick()
+  if (view === 'guide') document.querySelector('.library-content')?.scrollTo({ top: 0 })
   bindObserver()
 }
 
@@ -1861,7 +2050,12 @@ async function runGalleryAction(action: GalleryAction, singleId = '') {
   const count = singleId ? 1 : gallerySelectionCount.value
   if (!count) return
   const location = runtimeMode.value === 'browser' ? '此浏览器' : '本地磁盘'
-  if (!window.confirm(`确定永久删除 ${count} 张作品吗？图片将从${location}移除，无法恢复。`)) return
+  if (!await requestConfirmation({
+    title: `永久删除 ${count} 张作品？`,
+    message: `图片将从${location}移除，删除后无法恢复。`,
+    confirmLabel: '永久删除',
+    tone: 'danger',
+  })) return
   try {
     galleryMutationBusy.value = true
     const payload = { action, ...gallerySelectionPayload(singleId) }
@@ -2104,6 +2298,21 @@ async function copyPrompt(value = '') {
   }
 }
 
+async function copyGuideText(value: string, label: string) {
+  try {
+    await navigator.clipboard.writeText(value)
+    showToast('success', `${label}已复制`)
+  } catch {
+    showToast('error', '复制失败，请检查浏览器权限')
+  }
+}
+
+async function scrollGuideTo(id: string) {
+  if (activeView.value !== 'guide') await switchView('guide')
+  await nextTick()
+  document.getElementById(id)?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
 function clearFilters() {
   filters.keyword = ''
   filters.source = 'all'
@@ -2279,6 +2488,37 @@ async function restoreHistoryJob(item: JobSummary) {
   }
 }
 
+async function deleteHistoryJob(item: JobSummary) {
+  if (['queued', 'running'].includes(item.status) || deletingHistoryIds.has(item.id)) return
+  if (!await requestConfirmation({
+    title: '删除生成记录？',
+    message: '该任务将从最近生成中移除，已经生成的图片仍会保留在图库。',
+    confirmLabel: '删除记录',
+    tone: 'danger',
+  })) return
+  try {
+    deletingHistoryIds.add(item.id)
+    await api(`/api/jobs/${item.id}/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    })
+    if (job.value?.id === item.id) {
+      job.value = null
+      submitting.value = false
+    }
+    pollingJobIds.delete(item.id)
+    jobHistory.value = jobHistory.value.filter((entry) => entry.id !== item.id)
+    historyTotal.value = Math.max(0, historyTotal.value - 1)
+    showToast('success', '生成记录已删除，图库图片已保留')
+    await loadJobHistory(true)
+  } catch (error: any) {
+    showToast('error', error.message)
+  } finally {
+    deletingHistoryIds.delete(item.id)
+  }
+}
+
 function historyStatusIcon(status: string) {
   if (status === 'completed') return 'lucide:check'
   if (status === 'failed') return 'lucide:x'
@@ -2311,9 +2551,32 @@ function removeToast(id: string) {
   toasts.value = toasts.value.filter((item) => item.id !== id)
 }
 
+function requestConfirmation(options: ConfirmationOptions) {
+  if (confirmationResolver) confirmationResolver(false)
+  confirmation.value = {
+    title: options.title,
+    message: options.message,
+    confirmLabel: options.confirmLabel || '确认',
+    cancelLabel: options.cancelLabel || '取消',
+    tone: options.tone || 'neutral',
+  }
+  return new Promise<boolean>((resolve) => {
+    confirmationResolver = resolve
+    void nextTick(() => document.querySelector<HTMLElement>('.confirmation-confirm')?.focus())
+  })
+}
+
+function resolveConfirmation(confirmed: boolean) {
+  const resolve = confirmationResolver
+  confirmationResolver = null
+  confirmation.value = null
+  resolve?.(confirmed)
+}
+
 function onKeydown(event: KeyboardEvent) {
   if (event.key !== 'Escape') return
-  if (connectionOpen.value) closeConnection()
+  if (confirmation.value) resolveConfirmation(false)
+  else if (connectionOpen.value) closeConnection()
   else if (selectedImage.value) closeImageViewer()
   else closeSettings()
 }
@@ -2373,6 +2636,7 @@ onUnmounted(() => {
   if (filterTimer) clearTimeout(filterTimer)
   if (galleryFilterTimer) clearTimeout(galleryFilterTimer)
   if (libraryTimer) clearTimeout(libraryTimer)
+  if (confirmationResolver) resolveConfirmation(false)
   studioRuntime?.dispose()
 })
 </script>

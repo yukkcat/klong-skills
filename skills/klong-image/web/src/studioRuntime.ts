@@ -208,8 +208,9 @@ class BrowserRuntime implements StudioRuntime {
       if (action === 'delete') return this.deleteConnection(connectionId)
       return this.saveConnection(connectionId, payload)
     }
-    const jobMatch = url.pathname.match(/^\/api\/jobs\/([A-Za-z0-9_-]+)$/)
-    if (method === 'GET' && jobMatch) return this.getJob(jobMatch[1])
+    const jobMatch = url.pathname.match(/^\/api\/jobs\/([A-Za-z0-9_-]+)(?:\/(delete))?$/)
+    if (method === 'GET' && jobMatch && !jobMatch[2]) return this.getJob(jobMatch[1])
+    if (method === 'POST' && jobMatch?.[2] === 'delete') return this.deleteJobHistory(jobMatch[1])
 
     throw new Error(`浏览器运行时不支持 ${method} ${url.pathname}`)
   }
@@ -582,6 +583,16 @@ class BrowserRuntime implements StudioRuntime {
     const job = await this.db.get('jobs', jobId) as Record<string, any> | undefined
     if (!job) throw new Error('任务不存在')
     return this.hydrateJob(job)
+  }
+
+  private async deleteJobHistory(jobId: string) {
+    const job = await this.db.get('jobs', jobId) as Record<string, any> | undefined
+    if (!job) throw new Error('任务不存在')
+    if (this.activeJobs.has(jobId) || ['queued', 'running'].includes(String(job.status))) {
+      throw new Error('生成中的任务不能删除')
+    }
+    await this.db.delete('jobs', jobId)
+    return { id: jobId, deleted: true, images_preserved: true }
   }
 
   private async createJob(payload: Record<string, any>) {

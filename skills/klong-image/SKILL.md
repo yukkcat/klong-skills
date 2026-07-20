@@ -9,13 +9,13 @@ Use `scripts/generate.py` for deterministic API calls. Never put an API key in a
 
 ## Prompt Studio
 
-When the user wants to browse prompts or use a local webpage, run:
+When the user asks to open, launch, or use the local prompt workspace, handle the launch for them. Do not ask the user to run Python or `npm run dev`. If Prompt Studio is already running at `http://127.0.0.1:8765`, open that page and reuse it. Otherwise, run:
 
 ```shell
 python <skill-dir>/scripts/prompt_studio.py
 ```
 
-The command binds to `127.0.0.1:8765`, opens the browser, and saves generated files under the shared output directory. Resolution order is `--output-dir`, `KLONG_OUTPUT_DIR`, the location saved in Prompt Studio, then `outputs/prompt-studio` in the launch directory. On the first launch it downloads all built-in prompt sources in the background, then caches them under `~/.klong-image`. Later launches load the cache immediately. Use `--refresh` to force a full update, `--port <port>` when 8765 is occupied, or `--output-dir <path>` to lock the gallery/output directory for that launch.
+Keep the server process running and report the opened local URL. The command binds to `127.0.0.1:8765`, opens the browser, and saves generated files under the shared output directory. Resolution order is `--output-dir`, `KLONG_OUTPUT_DIR`, the location saved in Prompt Studio, then `outputs/prompt-studio` in the launch directory. On the first launch it downloads all built-in prompt sources in the background, then caches them under `~/.klong-image`. Later launches load the cache immediately. Use `--refresh` to force a full update, `--port <port>` when 8765 is occupied by another application, or `--output-dir <path>` to lock the gallery/output directory for that launch. Use `npm run dev` only when explicitly developing the Vue source; it is not the end-user launch path.
 
 Prompt Studio includes multi-connection management, `/v1/models` connection testing, persistent storage-location settings, real image generation, and a paginated gallery. Each connection keeps its own name, API address, encrypted key, synchronized model list, and default model. Users can add, switch, test, update, or delete connections from the local UI, and the creation workspace selects a connection before showing that connection's image models. On Windows, direct Codex generation automatically uses the same active connection even when an environment connection also exists. It indexes supported image files under the shared output directory and records task metadata under its `.klong/jobs` subdirectory. Direct Codex generation and web generation use the same manifest schema, so prompts, models, sizes, timings, failures, per-image details, history items, and gallery entries remain consistent. The gallery supports searching, sorting, configurable page sizes, current-page or all-filtered-result selection, batch ZIP downloads, and confirmed permanent deletion from local disk.
 

@@ -1067,6 +1067,8 @@ class Gallery:
             for manifest in manifests:
                 try:
                     data = json.loads(manifest.read_text(encoding="utf-8"))
+                    if data.get("history_hidden") is True:
+                        continue
                     job = self._job_from_manifest(data)
                     if job:
                         jobs.append(job)
@@ -1081,9 +1083,33 @@ class Gallery:
         try:
             with self.lock:
                 data = json.loads(target.read_text(encoding="utf-8"))
+            if data.get("history_hidden") is True:
+                return None
             return self._job_from_manifest(data)
         except (OSError, ValueError, TypeError, AttributeError):
             return None
+
+    def hide_job_history(self, job_id: str) -> bool:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", job_id):
+            raise ValueError("invalid job id")
+        target = self.metadata_dir / f"{job_id}.json"
+        with self.lock:
+            try:
+                data = json.loads(target.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                return False
+            if not isinstance(data, dict):
+                raise ValueError("invalid job manifest")
+            if data.get("history_hidden") is True:
+                return True
+            data["history_hidden"] = True
+            temporary = target.with_name(f".{target.name}.{secrets.token_hex(4)}.tmp")
+            temporary.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            try:
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return True
 
 
 class Jobs:
@@ -1243,6 +1269,19 @@ class Jobs:
             merged.update({job_id: dict(job) for job_id, job in self.jobs.items()})
         jobs = sorted(merged.values(), key=lambda job: str(job.get("created_at", "")), reverse=True)
         return {"items": [self._summary(job) for job in jobs[:limit]], "total": len(jobs)}
+
+    def delete_history(self, job_id: str) -> dict[str, Any]:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", job_id):
+            raise ValueError("invalid job id")
+        with self.lock:
+            current = self.jobs.get(job_id)
+            if current and current.get("status") in {"queued", "running"}:
+                raise ValueError("生成中的任务不能删除")
+            removed = self.jobs.pop(job_id, None) is not None
+        hidden = self.gallery.hide_job_history(job_id)
+        if not removed and not hidden:
+            raise ValueError("任务不存在")
+        return {"id": job_id, "deleted": True, "images_preserved": True}
 
 
 class AppServer(ThreadingHTTPServer):
@@ -1522,6 +1561,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.json_response(self.server.settings.update(connection_id, payload)); return
             if path == "/api/jobs":
                 self.json_response(self.server.create_job(payload), 202); return
+            job_delete_match = re.fullmatch(r"/api/jobs/([A-Za-z0-9_-]{1,80})/delete", path)
+            if job_delete_match:
+                self.json_response(self.server.jobs.delete_history(job_delete_match.group(1))); return
             if path == "/api/gallery/action":
                 self.json_response(self.server.gallery.action(payload)); return
             if path == "/api/gallery/archive":

@@ -25,10 +25,10 @@
 
 ### 本地提示词工作台
 
-安装 Skill 后，可以直接启动本地网页：
+安装 Skill 后，把下面这句话发送给 Codex；Codex 会自动启动本地服务并打开网页，不需要手动运行 Python 或 `npm run dev`：
 
-```powershell
-python .\skills\klong-image\scripts\prompt_studio.py
+```text
+使用 $klong-image 打开本地提示词工作台。
 ```
 
 程序会打开 `http://127.0.0.1:8765`。首次启动会在后台自动下载全部内置提示词源；后续启动直接读取本地缓存。网页支持搜索、来源与分类筛选、文生图/图生图、批量数量、并发设置和实时生成状态。
@@ -38,12 +38,6 @@ python .\skills\klong-image\scripts\prompt_studio.py
 网页和 Codex 直接生成的图片及任务记录共用同一个目录：默认保存在启动目录的 `outputs/prompt-studio` 下，任务元数据写入其中的 `.klong/jobs`。可在“设置 → 存储”中选择、打开或恢复图库位置；新位置会持久化到当前用户的 `~/.klong-image/settings.json`，Codex 后续直接生成也会自动使用。切换位置不会移动旧作品。`KLONG_OUTPUT_DIR` 可以锁定目录，网页单次启动也可用 `--output-dir` 覆盖；优先级为 `--output-dir`、`KLONG_OUTPUT_DIR`、网页保存位置、默认位置。
 
 图库支持按文件名、模型或提示词搜索，可切换排序方式和每页数量。可以选择本页，也可以一次选择当前搜索结果中的全部作品，然后批量打包为 ZIP 下载或删除。删除前会要求确认，确认后文件会直接从本地磁盘移除且无法恢复。点击图片仍可查看生成信息、复制提示词、下载原图或单独删除该作品。
-
-也可以直接告诉 Codex：
-
-```text
-使用 $klong-image 打开本地提示词工作台。
-```
 
 > 不熟悉 Codex 配置？查看图文教程：[使用 CC Switch 配置 Codex 接入小恐龙 API](docs/codex-cc-switch.md)。
 
