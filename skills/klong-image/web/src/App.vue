@@ -3,7 +3,19 @@
     <aside class="library-sidebar" aria-label="提示词库导航">
       <div class="brand-lockup">
         <span class="brand-mark">小</span>
-        <span class="brand-copy"><strong>小恐龙</strong><small>图像创作工作台 <span class="app-version">v{{ appVersion }}</span></small></span>
+        <span class="brand-copy">
+          <strong>小恐龙</strong>
+          <small>
+            图像创作工作台
+            <button
+              type="button"
+              class="app-version"
+              :class="{ 'update-available': updateAvailable }"
+              :title="updateAvailable ? `发现 ${updateStatus.latestVersion}` : '检查 Skill 更新'"
+              @click="openUpdateCenter"
+            >v{{ appVersion }}<i v-if="updateAvailable"></i></button>
+          </small>
+        </span>
         <a
           class="github-link"
           href="https://github.com/yukkcat/klong-skills"
@@ -21,7 +33,7 @@
           <Icon icon="lucide:library-big" />
           <span>提示词</span>
         </button>
-        <button type="button" :class="{ active: activeView === 'create' }" @click="startNewCreation">
+        <button type="button" :class="{ active: activeView === 'create' }" @click="switchView('create')">
           <Icon icon="lucide:wand-sparkles" />
           <span>创作</span>
         </button>
@@ -125,7 +137,7 @@
                 </span>
                 <span class="creation-history-copy">
                   <strong>{{ historyItemTitle(item) }}</strong>
-                  <small><span>{{ item.model }}</span><span>{{ item.count }} 张</span><time>{{ formatDate(item.created_at) }}</time></small>
+                  <small><span>{{ item.model }}</span><span>{{ item.count }} 张</span><time>{{ formatDate(item.updated_at || item.created_at) }}</time></small>
                 </span>
               </button>
               <Button
@@ -153,6 +165,7 @@
         <button type="button" @click="scrollGuideTo('guide-launch')"><Icon icon="lucide:panel-top-open" /><span>启动工作台</span><small>02</small></button>
         <button type="button" @click="scrollGuideTo('guide-connect')"><Icon icon="lucide:key-round" /><span>配置连接</span><small>03</small></button>
         <button type="button" @click="scrollGuideTo('guide-use')"><Icon icon="lucide:sparkles" /><span>开始使用</span><small>04</small></button>
+        <button type="button" @click="scrollGuideTo('guide-update')"><Icon icon="lucide:refresh-cw" /><span>更新 Skill</span><small>05</small></button>
       </nav>
 
       <div v-if="activeView === 'prompts'" class="sidebar-status">
@@ -190,7 +203,7 @@
         <div class="mobile-wordmark"><span class="brand-mark">小</span><strong>{{ mobileViewLabel }}</strong></div>
         <div class="mobile-view-switch" aria-label="切换工作区">
           <button type="button" :class="{ active: activeView === 'prompts' }" title="提示词" @click="switchView('prompts')"><Icon icon="lucide:library-big" /></button>
-          <button type="button" :class="{ active: activeView === 'create' }" title="新建创作" @click="startNewCreation"><Icon icon="lucide:wand-sparkles" /></button>
+          <button type="button" :class="{ active: activeView === 'create' }" title="创作" @click="switchView('create')"><Icon icon="lucide:wand-sparkles" /></button>
           <button type="button" :class="{ active: activeView === 'gallery' }" title="图库" @click="switchView('gallery')"><Icon icon="lucide:images" /></button>
         </div>
 
@@ -240,6 +253,17 @@
            @click="resetGallery()"
         >
           <Icon icon="lucide:refresh-cw" :class="{ spin: loadingGallery }" />
+        </Button>
+        <Button
+          v-if="updateAvailable"
+          size="md"
+          variant="outline"
+          root-class="header-update-button"
+          :title="`发现新版本 ${updateStatus.latestVersion}`"
+          @click="openUpdateCenter"
+        >
+          <Icon icon="lucide:arrow-up-circle" />
+          <span>更新</span>
         </Button>
         <Button
           size="md"
@@ -448,25 +472,36 @@
                       @update:model-value="changeWorkbenchConnection"
                     />
                   </FormField>
-                  <FormField label="模型">
-                    <FilterSelect
-                      v-model="form.model"
-                      class="workbench-model-select"
-                      :options="modelOptions"
-                      size="md"
-                      placement="down"
-                      selected-indicator="check"
-                      aria-label="生成模型"
-                      @update:model-value="normalizeModel"
-                    />
+                  <FormField label="模型" :hint="`${allModels.length} 个候选模型`">
+                    <button
+                      type="button"
+                      class="parameter-picker-trigger"
+                      :class="{ empty: !form.model }"
+                      aria-label="选择生成模型"
+                      @click="openModelPicker('creation')"
+                    >
+                      <span>{{ form.model || '选择生成模型' }}</span>
+                      <Icon icon="lucide:chevrons-up-down" />
+                    </button>
                   </FormField>
                   <div class="field-row">
-                    <FormField label="尺寸"><Input v-model="form.size" size="md" block :disabled="isGemini" placeholder="1024x1024" /></FormField>
+                    <FormField label="尺寸">
+                      <button
+                        type="button"
+                        class="parameter-picker-trigger"
+                        :disabled="isGemini"
+                        aria-label="选择生成尺寸"
+                        @click="openSizePicker"
+                      >
+                        <span>{{ selectedSizeLabel }}</span>
+                        <Icon icon="lucide:panels-top-left" />
+                      </button>
+                    </FormField>
                     <FormField label="数量"><Input v-model="form.count" type="number" min="1" size="md" block /></FormField>
                   </div>
                   <div class="field-row compact-row">
                     <FormField label="并发"><Input v-model="form.concurrency" type="number" min="1" size="md" block :disabled="serialModel" /></FormField>
-                    <FormField label="输出格式"><Input model-value="PNG" size="md" block disabled /></FormField>
+                    <FormField label="输出格式"><Input model-value="自动 · PNG/JPG/WebP" size="md" block disabled /></FormField>
                   </div>
                   <details class="advanced-settings">
                     <summary><span><Icon icon="lucide:sliders-horizontal" />高级设置</span><Icon icon="lucide:chevron-down" /></summary>
@@ -485,11 +520,11 @@
                   size="md"
                   variant="primary"
                   root-class="workbench-generate-button"
-                  :disabled="submitting || !form.prompt.trim()"
+                  :disabled="submitting || !form.prompt.trim() || !form.model"
                   @click="createJob"
                 >
                   <Icon :icon="submitting ? 'lucide:loader-circle' : 'lucide:wand-sparkles'" :class="{ spin: submitting }" />
-                  {{ submitting ? '正在生成' : `生成 ${Math.max(1, Number(form.count) || 1)} 张` }}
+                  {{ submitting ? '正在生成' : `${job ? '继续生成' : '生成'} ${Math.max(1, Number(form.count) || 1)} 张` }}
                 </Button>
               </footer>
             </aside>
@@ -505,20 +540,20 @@
 
               <section v-if="job" class="creation-job-strip">
                 <div class="job-title">
-                  <div><h3>{{ statusLabel(job.status) }}</h3><p>{{ job.model }} · {{ job.count }} 张 · 并发 {{ job.concurrency }}</p></div>
+                  <div><h3>{{ statusLabel(job.status) }}</h3><p>{{ job.model }} · 本次 {{ job.count }} 张 · 累计 {{ job.result?.requested || job.count }} 张</p></div>
                   <MetaChip :tone="jobTone" variant="soft" size="sm">{{ jobPercent }}%</MetaChip>
                 </div>
                 <div class="job-progress"><div :style="{ width: `${jobPercent}%` }"></div></div>
                 <div class="job-stats">
-                  <span><strong>{{ job.result?.succeeded || 0 }}</strong>成功</span>
-                  <span><strong>{{ job.result?.failed || 0 }}</strong>失败</span>
-                  <span><strong>{{ job.result?.duration_seconds || elapsed }}</strong>秒</span>
+                  <span><strong>{{ job.result?.succeeded || 0 }}</strong>累计成功</span>
+                  <span><strong>{{ job.result?.failed || 0 }}</strong>累计失败</span>
+                  <span><strong>{{ job.result?.batches?.length || 1 }}</strong>批次</span>
                 </div>
                 <p v-if="job.error" class="job-error">{{ job.error }}</p>
               </section>
 
               <section v-if="job?.result?.images?.length" class="creation-results-grid">
-                <button v-for="image in job.result.images" :key="image.index" type="button" @click="openGeneratedImage(image)">
+                <button v-for="image in job.result.images" :key="image.id || `${image.batch_id || 'legacy'}-${image.index}`" type="button" @click="openGeneratedImage(image)">
                   <span class="creation-result-media">
                     <img v-if="image.url" :src="image.url" :alt="`生成结果 ${image.index}`" />
                     <Icon v-else icon="lucide:image" />
@@ -526,7 +561,7 @@
                   </span>
                   <span class="creation-result-caption">
                     <strong>结果 {{ image.index }}</strong>
-                    <small>{{ image.width }} × {{ image.height }} · {{ formatBytes(image.bytes) }} · {{ image.duration_seconds }} 秒</small>
+                    <small>{{ image.model || job.model }} · {{ image.width }} × {{ image.height }} · {{ formatBytes(image.bytes) }}</small>
                   </span>
                 </button>
               </section>
@@ -754,7 +789,7 @@
               <ol class="guide-checklist">
                 <li><span>1</span><p>前往小恐龙控制台创建 API Key。</p><a href="https://api.klong.lat/keys" target="_blank" rel="noreferrer">创建 Key<Icon icon="lucide:arrow-up-right" /></a></li>
                 <li><span>2</span><p>打开连接设置，填写名称、API 地址和 Key。</p><Button size="sm" variant="outline" @click="openConnection"><Icon icon="lucide:settings-2" />打开设置</Button></li>
-                <li><span>3</span><p>点击“测试并获取模型”，选择默认模型，然后保存并设为当前连接。</p></li>
+                <li><span>3</span><p>点击“同步模型”，在弹窗中选择默认模型，然后保存并设为当前连接。</p></li>
               </ol>
               <div class="guide-security"><Icon icon="lucide:shield-check" /><p><strong>{{ runtimeMode === 'browser' ? '浏览器加密存储' : '本地安全存储' }}</strong><small>{{ runtimeMode === 'browser' ? 'Key 使用浏览器 Web Crypto 加密，Vercel 不接收也不保存；清除站点数据会一并清除。' : 'Windows 使用当前用户的 DPAPI 加密保存 Key；网页和 Codex 直调使用同一个当前连接。' }}</small></p></div>
             </section>
@@ -774,6 +809,32 @@
               <div class="guide-command guide-codex-command">
                 <code>{{ codexExamplePrompt }}</code>
                 <Button size="sm" variant="outline" @click="copyGuideText(codexExamplePrompt, 'Codex 示例')"><Icon icon="lucide:copy" />复制示例</Button>
+              </div>
+            </section>
+
+            <section id="guide-update" class="guide-section">
+              <header class="guide-section-heading">
+                <span class="guide-step">05</span>
+                <div><h2>检查并更新 Skill</h2><p>工作台会定期读取 GitHub 版本标签；发现新版本时，只提醒一次，不会自动改写本地文件。</p></div>
+              </header>
+              <div class="guide-update-panel" :class="{ available: updateAvailable, error: !!updateStatus.error }" aria-live="polite">
+                <span class="guide-update-icon">
+                  <Icon :icon="updateStatus.checking ? 'lucide:loader-circle' : updateAvailable ? 'lucide:arrow-up-circle' : updateStatus.error ? 'lucide:circle-alert' : 'lucide:badge-check'" :class="{ spin: updateStatus.checking }" />
+                </span>
+                <div class="guide-update-copy">
+                  <small>{{ updateStatusText }}</small>
+                  <strong>v{{ appVersion }}<Icon icon="lucide:arrow-right" />{{ updateStatus.latestVersion || '等待检查' }}</strong>
+                  <p>{{ updateAvailable ? '复制更新指令并发给 Codex，安装器会从仓库更新 klong-image。' : updateStatus.error || '当前版本可以继续使用。' }}</p>
+                </div>
+                <div class="guide-update-actions">
+                  <Button size="sm" variant="outline" :disabled="updateStatus.checking" @click="checkForUpdates(true)">
+                    <Icon icon="lucide:refresh-cw" :class="{ spin: updateStatus.checking }" />重新检查
+                  </Button>
+                  <Button size="sm" variant="primary" @click="copyGuideText(updateSkillPrompt, '更新指令')">
+                    <Icon icon="lucide:copy" />复制更新指令
+                  </Button>
+                  <a :href="latestTagUrl" target="_blank" rel="noreferrer">查看版本<Icon icon="lucide:arrow-up-right" /></a>
+                </div>
               </div>
             </section>
 
@@ -860,6 +921,8 @@
           </div>
           <dl v-if="imageViewerSource === 'gallery'" class="viewer-meta">
             <template v-if="selectedImage.model"><dt>模型</dt><dd>{{ selectedImage.model }}</dd></template>
+            <template v-if="selectedImage.size"><dt>尺寸</dt><dd>{{ selectedImage.size }}</dd></template>
+            <template v-if="selectedImage.connection_name"><dt>连接</dt><dd>{{ selectedImage.connection_name }}</dd></template>
             <template v-if="selectedImage.mode"><dt>模式</dt><dd>{{ modeLabel(selectedImage.mode) }}</dd></template>
             <template v-if="selectedImage.duration_seconds"><dt>耗时</dt><dd>{{ selectedImage.duration_seconds }} 秒</dd></template>
             <template v-if="selectedImage.relative_path"><dt>文件</dt><dd><code>{{ selectedImage.relative_path }}</code></dd></template>
@@ -1003,16 +1066,20 @@
                     />
                   </FormField>
                   <FormField label="默认模型" :hint="`${connectionEditorModels.length} 个候选模型`">
-                    <FilterSelect
-                      v-model="connectionForm.default_model"
-                      class="connection-model-select"
-                      :options="connectionModelOptions"
-                      size="md"
-                      placement="down"
-                      selected-indicator="check"
+                    <button
+                      type="button"
+                      class="connection-model-trigger"
+                      :class="{ empty: !connectionForm.default_model }"
                       :disabled="editingConnection?.readonly"
                       aria-label="默认生成模型"
-                    />
+                      @click="openModelPicker('connection')"
+                    >
+                      <span>
+                        <strong>{{ connectionForm.default_model || '选择默认模型' }}</strong>
+                        <small>{{ connectionEditorModels.length ? `${connectionEditorModels.length} 个模型可选` : '请先同步当前连接的模型' }}</small>
+                      </span>
+                      <Icon icon="lucide:chevrons-up-down" />
+                    </button>
                   </FormField>
                 </div>
 
@@ -1049,7 +1116,7 @@
                   type="submit"
                   size="md"
                   variant="primary"
-                  :disabled="savingConnection || testingConnection"
+                  :disabled="savingConnection || testingConnection || !connectionForm.default_model"
                 >
                   <Icon :icon="savingConnection ? 'lucide:loader-circle' : 'lucide:save'" :class="{ spin: savingConnection }" />
                   {{ savingConnection ? '保存中' : editingConnection ? '保存更改' : '添加连接' }}
@@ -1217,6 +1284,141 @@
       </aside>
     </div>
 
+    <div v-if="modelPickerOpen" class="model-picker-layer" role="presentation" @mousedown.self="closeModelPicker">
+      <section
+        class="model-picker-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="model-picker-title"
+      >
+        <header class="model-picker-header">
+          <span class="model-picker-icon"><Icon icon="lucide:boxes" /></span>
+          <span>
+            <h2 id="model-picker-title">{{ modelPickerTitle }}</h2>
+            <small>{{ modelPickerModels.length }} 个模型来自当前连接</small>
+          </span>
+          <Button size="sm" variant="ghost" icon-only root-class="model-picker-close" title="关闭" @click="closeModelPicker">
+            <Icon icon="lucide:x" />
+          </Button>
+        </header>
+
+        <label class="model-picker-search">
+          <Icon icon="lucide:search" />
+          <input
+            ref="modelPickerSearchInput"
+            v-model="modelPickerSearch"
+            type="search"
+            placeholder="搜索模型名称"
+            aria-label="搜索模型名称"
+            autocomplete="off"
+          />
+          <small>{{ filteredModelPickerModels.length }}</small>
+        </label>
+
+        <div class="model-picker-list" role="radiogroup" aria-label="可用模型">
+          <button
+            v-for="model in filteredModelPickerModels"
+            :key="model"
+            type="button"
+            role="radio"
+            :aria-checked="modelPickerSelection === model"
+            :class="{ selected: modelPickerSelection === model }"
+            @click="modelPickerSelection = model"
+            @dblclick="applySelectedModel"
+          >
+            <span class="model-picker-row-icon"><Icon icon="lucide:box" /></span>
+            <strong>{{ model }}</strong>
+            <Icon v-if="modelPickerSelection === model" icon="lucide:circle-check" class="model-picker-check" />
+          </button>
+          <div v-if="!filteredModelPickerModels.length" class="model-picker-empty">
+            <Icon icon="lucide:search-x" />
+            <strong>没有匹配的模型</strong>
+            <small>换一个关键词再试</small>
+          </div>
+        </div>
+
+        <footer class="model-picker-footer">
+          <span>
+            <small>当前选择</small>
+            <strong>{{ modelPickerSelection || '尚未选择' }}</strong>
+          </span>
+          <Button size="md" variant="outline" @click="closeModelPicker">取消</Button>
+          <Button size="md" variant="primary" :disabled="!modelPickerSelection" @click="applySelectedModel">使用此模型</Button>
+        </footer>
+      </section>
+    </div>
+
+    <div v-if="sizePickerOpen" class="model-picker-layer" role="presentation" @mousedown.self="closeSizePicker">
+      <section
+        class="model-picker-dialog size-picker-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="size-picker-title"
+      >
+        <header class="model-picker-header">
+          <span class="model-picker-icon"><Icon icon="lucide:panels-top-left" /></span>
+          <span>
+            <h2 id="size-picker-title">选择画面尺寸</h2>
+            <small>比例与清晰度会转换为实际像素</small>
+          </span>
+          <Button size="sm" variant="ghost" icon-only root-class="model-picker-close" title="关闭" @click="closeSizePicker">
+            <Icon icon="lucide:x" />
+          </Button>
+        </header>
+
+        <div class="size-picker-content">
+          <section class="size-picker-section">
+            <header><strong>画面比例</strong><small>{{ sizePickerRatio === 'auto' ? '自动' : sizePickerRatio }}</small></header>
+            <div class="ratio-option-grid" role="radiogroup" aria-label="画面比例">
+              <button
+                v-for="ratio in IMAGE_RATIOS"
+                :key="ratio"
+                type="button"
+                role="radio"
+                :aria-checked="sizePickerRatio === ratio"
+                :class="{ selected: sizePickerRatio === ratio }"
+                @click="selectSizeRatio(ratio)"
+              >
+                <span class="ratio-preview">
+                  <Icon v-if="ratio === 'auto'" icon="lucide:scan" />
+                  <i v-else :style="{ aspectRatio: ratio.replace(':', ' / ') }"></i>
+                </span>
+                <strong>{{ ratio === 'auto' ? '自动' : ratio }}</strong>
+              </button>
+            </div>
+          </section>
+
+          <section class="size-picker-section">
+            <header><strong>清晰度</strong><small>{{ sizePickerResolution === 'auto' ? '自动' : sizePickerResolution }}</small></header>
+            <div class="resolution-option-grid" role="radiogroup" aria-label="清晰度">
+              <button
+                v-for="resolution in IMAGE_RESOLUTIONS"
+                :key="resolution"
+                type="button"
+                role="radio"
+                :aria-checked="sizePickerResolution === resolution"
+                :class="{ selected: sizePickerResolution === resolution }"
+                :disabled="!sizeResolutionAvailable(resolution)"
+                @click="selectSizeResolution(resolution)"
+              >
+                <span><strong>{{ resolution === 'auto' ? '自动' : resolution }}</strong><small>{{ sizeResolutionPixels(resolution) }}</small></span>
+                <Icon v-if="sizePickerResolution === resolution" icon="lucide:circle-check" />
+              </button>
+            </div>
+          </section>
+        </div>
+
+        <footer class="model-picker-footer">
+          <span>
+            <small>当前选择</small>
+            <strong>{{ sizePickerSelectionLabel }}</strong>
+          </span>
+          <Button size="md" variant="outline" @click="closeSizePicker">取消</Button>
+          <Button size="md" variant="primary" @click="applySelectedSize">使用此尺寸</Button>
+        </footer>
+      </section>
+    </div>
+
     <div v-if="confirmation" class="confirmation-layer" role="presentation" @mousedown.self="resolveConfirmation(false)">
       <section
         class="confirmation-dialog"
@@ -1260,6 +1462,17 @@ import { Button as NanocatButton, EmptyState, FilterSelect as NanocatFilterSelec
 import type { SelectOption, ToastItem } from 'nanocat-ui'
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import packageInfo from '../package.json'
+import { compareVersions, latestVersionTag } from './updateChecker'
+import {
+  IMAGE_RATIOS,
+  IMAGE_RESOLUTIONS,
+  IMAGE_SIZE_PRESETS,
+  constrainImageSizeValue,
+  imageSizeLabel,
+  imageSizePreset,
+  type ImageRatio,
+  type ImageResolution,
+} from './imageSizes'
 import { createStudioRuntime, type RuntimeMode, type StudioRuntime } from './studioRuntime'
 
 // nanocat-ui 0.1.x accepts these runtime variants/emit shapes but its declarations are narrower.
@@ -1287,6 +1500,7 @@ type JobSummary = {
   name: string
   status: string
   created_at: string
+  updated_at?: string
   completed_at?: string
   model: string
   count: number
@@ -1307,6 +1521,9 @@ type GalleryItem = {
   model?: string
   protocol?: string
   mode?: string
+  size?: string
+  connection_id?: string
+  connection_name?: string
   width?: number
   height?: number
   duration_seconds?: number
@@ -1325,6 +1542,7 @@ type ConnectionProfile = {
   readonly: boolean
 }
 type SettingsSection = 'connections' | 'storage'
+type ModelPickerTarget = 'connection' | 'creation'
 type StorageStatus = {
   output_dir: string
   default_output_dir: string
@@ -1349,21 +1567,33 @@ type ConfirmationState = Required<ConfirmationOptions>
 
 const PAGE_SIZE = 24
 const appVersion = packageInfo.version
+const repositoryUrl = 'https://github.com/yukkcat/klong-skills'
+const updateCheckUrl = 'https://api.github.com/repos/yukkcat/klong-skills/tags?per_page=20'
+const updateCacheKey = 'klong-prompt-studio-update-check-v1'
+const updateNoticeKey = 'klong-prompt-studio-update-notice-v1'
+const updateCacheMaxAge = 12 * 60 * 60 * 1000
 const installSkillPrompt = '请从 https://github.com/yukkcat/klong-skills/tree/main/skills/klong-image 安装这个 Skill。'
 const openStudioPrompt = '使用 $klong-image 打开本地提示词工作台。'
 const codexExamplePrompt = '使用 $klong-image，通过 gpt-image-2 生成一张白底产品图，保存到 outputs/prompt-studio/product.png。'
+const updateStatus = reactive({ latestVersion: '', checkedAt: 0, checked: false, checking: false, error: '' })
+const updateAvailable = computed(() => compareVersions(updateStatus.latestVersion, appVersion) > 0)
+const latestTagUrl = computed(() => updateStatus.latestVersion ? `${repositoryUrl}/tree/${encodeURIComponent(updateStatus.latestVersion)}` : `${repositoryUrl}/tags`)
+const updateSkillPrompt = computed(() => {
+  const version = updateStatus.latestVersion || 'main'
+  const source = `${repositoryUrl}/tree/${version}/skills/klong-image`
+  return `请把已安装的 klong-image Skill 更新到 ${version}。先停止本地提示词工作台，备份现有 klong-image 目录和其中的 .env，再移走旧目录并使用 skill-installer 从 ${source} 安装；成功后恢复 .env 并删除备份，失败则恢复原目录。不要删除 ~/.klong-image、outputs 或图库文件。完成后提醒我重启 Codex。`
+})
+const updateStatusText = computed(() => {
+  if (updateStatus.checking) return '正在检查 GitHub 版本'
+  if (updateStatus.error) return '版本检查失败'
+  if (updateAvailable.value) return '发现可用更新'
+  if (updateStatus.checked) return '当前已是最新版本'
+  return '尚未检查版本'
+})
 const token = document.querySelector<HTMLMetaElement>('meta[name="klong-token"]')?.content || ''
 const runtimeMode = ref<RuntimeMode>('local')
 let studioRuntime: StudioRuntime | null = null
 let runtimePromise: Promise<StudioRuntime> | null = null
-const builtInModels = [
-  'gpt-image-2',
-  'gpt-image-2-c',
-  'gpt-image-2-codex',
-  'gpt-image-2-vip',
-  'gemini-3-pro-image-preview',
-  'gemini-3.1-flash-image-preview',
-]
 const sourceDisplay: Record<string, { badge: string; name: string }> = {
   'banana-prompt-quicker': { badge: 'B', name: 'Banana' },
   'awesome-gpt-image': { badge: 'A', name: 'GPT Image' },
@@ -1423,13 +1653,13 @@ const elapsed = ref(0)
 const toasts = ref<ToastItem[]>([])
 const confirmation = ref<ConfirmationState | null>(null)
 const deletingHistoryIds = reactive(new Set<string>())
-const form = reactive<any>({ prompt: '', connection_id: '', model: 'gpt-image-2', size: '', filename: 'generated', count: 1, concurrency: 1 })
+const form = reactive<any>({ prompt: '', connection_id: '', model: '', size: '', filename: 'generated', count: 1, concurrency: 1 })
 const settingsStatus = reactive<any>({
   active_connection_id: '',
   active_connection: null,
   connections: [],
   base_url: 'https://api.klong.lat',
-  default_model: 'gpt-image-2',
+  default_model: '',
   key_configured: false,
   key_source: 'none',
   key_hint: '',
@@ -1437,10 +1667,18 @@ const settingsStatus = reactive<any>({
   models: [],
 })
 const editingConnectionId = ref('')
-const connectionForm = reactive({ name: '', base_url: 'https://api.klong.lat', api_key: '', default_model: 'gpt-image-2' })
+const connectionForm = reactive({ name: '', base_url: 'https://api.klong.lat', api_key: '', default_model: '' })
 const testedModels = ref<string[]>([])
 const testingConnection = ref(false)
 const savingConnection = ref(false)
+const modelPickerOpen = ref(false)
+const modelPickerTarget = ref<ModelPickerTarget>('connection')
+const modelPickerSearch = ref('')
+const modelPickerSelection = ref('')
+const modelPickerSearchInput = ref<HTMLInputElement | null>(null)
+const sizePickerOpen = ref(false)
+const sizePickerRatio = ref<ImageRatio>('auto')
+const sizePickerResolution = ref<ImageResolution>('auto')
 const storageStatus = reactive<StorageStatus>({
   output_dir: '',
   default_output_dir: '',
@@ -1562,36 +1800,42 @@ const connectionOptions = computed<SelectOption[]>(() => connections.value.map((
   label: `${connection.name}${connection.key_configured ? '' : ' · 未配置 Key'}`,
   value: connection.id,
 })))
-function imageModelIds(models: string[]) {
-  const unique = Array.from(new Set(models.filter(Boolean)))
-  const imagePattern = /(?:^|[-_.\/])(image|images|imagen|flux|recraft|dall[-_.]?e|stable[-_.]?diffusion|sdxl|midjourney|banana)(?:[-_.\/]|$)/i
-  const filtered = unique.filter((model) => imagePattern.test(model))
-  return filtered.length ? filtered : unique
-}
 const allModels = computed(() => Array.from(new Set([
-  ...imageModelIds(generationConnection.value?.models?.length ? generationConnection.value.models : builtInModels),
+  ...(generationConnection.value?.models || []),
   form.model,
   generationConnection.value?.default_model,
 ].filter(Boolean))))
 const modelOptions = computed<SelectOption[]>(() => allModels.value.map((model) => ({ label: model, value: model })))
 const connectionEditorModels = computed(() => Array.from(new Set([
-  ...imageModelIds(
-    testedModels.value.length
-      ? testedModels.value
-      : editingConnection.value?.models?.length
-        ? editingConnection.value.models
-        : builtInModels,
-  ),
-  connectionForm.default_model,
+  ...(testedModels.value.length ? testedModels.value : editingConnection.value?.models || []),
 ].filter(Boolean))))
-const connectionModelOptions = computed<SelectOption[]>(() => connectionEditorModels.value.map((model) => ({ label: model, value: model })))
+const modelPickerModels = computed(() => (
+  modelPickerTarget.value === 'creation' ? allModels.value : connectionEditorModels.value
+))
+const modelPickerTitle = computed(() => (
+  modelPickerTarget.value === 'creation' ? '选择生成模型' : '选择默认模型'
+))
+const filteredModelPickerModels = computed(() => {
+  const keyword = modelPickerSearch.value.trim().toLocaleLowerCase()
+  return keyword
+    ? modelPickerModels.value.filter((model) => model.toLocaleLowerCase().includes(keyword))
+    : modelPickerModels.value
+})
 const serialModel = computed(() => ['gpt-image-2-codex', 'gpt-image-2-vip'].includes(form.model))
 const isGemini = computed(() => String(form.model).startsWith('gemini-'))
+const selectedSizeLabel = computed(() => imageSizeLabel(form.size || 'auto'))
+const sizePickerSelection = computed(() => (
+  IMAGE_SIZE_PRESETS.find((preset) => (
+    preset.ratio === sizePickerRatio.value && preset.resolution === sizePickerResolution.value
+  )) || IMAGE_SIZE_PRESETS[0]
+))
+const sizePickerSelectionLabel = computed(() => imageSizeLabel(sizePickerSelection.value.value))
 const jobPercent = computed(() => {
   if (!job.value) return 0
   if (job.value.status === 'completed') return 100
-  const done = (job.value.result?.succeeded || 0) + (job.value.result?.failed || 0)
-  return Math.max(5, Math.round(done / Math.max(1, Number(job.value.count)) * 100))
+  const current = job.value.result?.current_batch
+  const done = (current?.succeeded || 0) + (current?.failed || 0)
+  return Math.max(5, Math.round(done / Math.max(1, Number(current?.count || job.value.count)) * 100))
 })
 const jobTone = computed<ToastTone>(() => {
   if (job.value?.status === 'completed') return 'success'
@@ -1637,7 +1881,7 @@ async function loadSettings() {
     const data = await api('/api/settings')
     Object.assign(settingsStatus, data)
     form.connection_id = data.active_connection_id || ''
-    if (!selected.value && !job.value) form.model = data.active_connection?.default_model || data.default_model || form.model
+    if (!selected.value && !job.value) form.model = data.active_connection_id ? data.active_connection?.default_model || '' : ''
   } catch (error: any) {
     showToast('error', error.message)
   }
@@ -1664,6 +1908,7 @@ function openConnection() {
 }
 
 function closeConnection() {
+  closeModelPicker()
   connectionOpen.value = false
 }
 
@@ -1787,8 +2032,99 @@ function fillConnectionForm(connection: ConnectionProfile | null) {
   connectionForm.name = connection?.name || ''
   connectionForm.base_url = connection?.base_url || 'https://api.klong.lat'
   connectionForm.api_key = ''
-  connectionForm.default_model = connection?.default_model || 'gpt-image-2'
+  connectionForm.default_model = connection?.default_model || ''
   testedModels.value = []
+  closeModelPicker()
+}
+
+function openModelPicker(target: ModelPickerTarget = 'connection') {
+  const models = target === 'creation' ? allModels.value : connectionEditorModels.value
+  if (!models.length) {
+    showToast('warning', '请先同步当前连接的模型')
+    return
+  }
+  modelPickerTarget.value = target
+  modelPickerSearch.value = ''
+  const currentModel = target === 'creation' ? form.model : connectionForm.default_model
+  modelPickerSelection.value = models.includes(currentModel)
+    ? currentModel
+    : ''
+  modelPickerOpen.value = true
+  void nextTick(() => modelPickerSearchInput.value?.focus())
+}
+
+function closeModelPicker() {
+  modelPickerOpen.value = false
+  modelPickerSearch.value = ''
+  modelPickerSelection.value = ''
+}
+
+function applySelectedModel() {
+  if (!modelPickerSelection.value) return
+  if (modelPickerTarget.value === 'creation') {
+    form.model = modelPickerSelection.value
+    normalizeModel()
+  } else {
+    connectionForm.default_model = modelPickerSelection.value
+  }
+  closeModelPicker()
+}
+
+function openSizePicker() {
+  if (isGemini.value) return
+  const currentSelectionValue = sizePickerSelection.value.value === 'auto' ? '' : sizePickerSelection.value.value
+  if (currentSelectionValue !== form.size) {
+    const current = imageSizePreset(form.size || 'auto')
+    sizePickerRatio.value = current.ratio
+    sizePickerResolution.value = current.resolution
+  }
+  sizePickerOpen.value = true
+}
+
+function closeSizePicker() {
+  sizePickerOpen.value = false
+}
+
+function sizeResolutionAvailable(resolution: ImageResolution) {
+  if (sizePickerRatio.value === 'auto') return true
+  return resolution !== 'auto'
+}
+
+function sizeResolutionPixels(resolution: ImageResolution) {
+  if (resolution === 'auto') return '由模型决定'
+  const exact = IMAGE_SIZE_PRESETS.find((preset) => (
+    preset.ratio === sizePickerRatio.value && preset.resolution === resolution
+  ))
+  const fallback = IMAGE_SIZE_PRESETS.find((preset) => preset.resolution === resolution)
+  const selectedPreset = exact || fallback
+  return selectedPreset?.width && selectedPreset?.height
+    ? `${selectedPreset.width}x${selectedPreset.height}${selectedPreset.limited ? ' · 接口上限' : ''}`
+    : '当前比例不可用'
+}
+
+function selectSizeRatio(ratio: ImageRatio) {
+  if (ratio === 'auto') {
+    sizePickerRatio.value = 'auto'
+    sizePickerResolution.value = 'auto'
+    return
+  }
+  sizePickerRatio.value = ratio
+  if (sizePickerResolution.value === 'auto') sizePickerResolution.value = '1K'
+}
+
+function selectSizeResolution(resolution: ImageResolution) {
+  if (resolution === 'auto') {
+    sizePickerRatio.value = 'auto'
+    sizePickerResolution.value = 'auto'
+    return
+  }
+  if (sizePickerRatio.value === 'auto') sizePickerRatio.value = '1:1'
+  sizePickerResolution.value = resolution
+}
+
+function applySelectedSize() {
+  form.size = sizePickerSelection.value.value === 'auto' ? '' : sizePickerSelection.value.value
+  closeSizePicker()
 }
 
 function selectConnectionEditor(connectionId: string) {
@@ -1808,7 +2144,7 @@ function applySettings(data: any, useDefaultModel = false) {
   form.connection_id = data.active_connection_id || ''
   const active = data.active_connection || data.connections?.find((item: ConnectionProfile) => item.id === data.active_connection_id)
   if (useDefaultModel || !modelOptions.value.some((option) => option.value === form.model)) {
-    form.model = active?.default_model || form.model
+    form.model = active?.default_model || ''
   }
 }
 
@@ -1840,8 +2176,14 @@ async function testConnection() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ ...connectionForm, connection_id: editingConnectionId.value }),
     })
-    testedModels.value = result.models || []
-    showToast('success', `连接成功，发现 ${result.model_count} 个模型`)
+    testedModels.value = Array.from(new Set((result.models || []).map(String).filter(Boolean)))
+    if (!testedModels.value.length) {
+      showToast('warning', '连接成功，但 /v1/models 没有返回可选模型')
+      return
+    }
+    if (!testedModels.value.includes(connectionForm.default_model)) connectionForm.default_model = ''
+    showToast('success', `连接成功，发现 ${testedModels.value.length} 个模型`)
+    openModelPicker()
   } catch (error: any) {
     showToast('error', error.message)
   } finally {
@@ -1973,10 +2315,13 @@ async function switchView(view: WorkspaceView) {
 }
 
 async function startNewCreation() {
+  const availableModels = generationConnection.value?.models || []
   const defaultModel = generationConnection.value?.default_model
     || activeConnection.value?.default_model
-    || settingsStatus.default_model
-    || 'gpt-image-2'
+    || ''
+  const preferredModel = form.model && (!availableModels.length || availableModels.includes(form.model))
+    ? form.model
+    : defaultModel
 
   settingsOpen.value = false
   selected.value = null
@@ -1986,11 +2331,9 @@ async function startNewCreation() {
   startedAt.value = 0
   elapsed.value = 0
   form.prompt = ''
-  form.model = defaultModel
-  form.size = ''
+  form.model = preferredModel
   form.filename = 'generated'
-  form.count = 1
-  form.concurrency = 1
+  normalizeModel()
   await switchView('create')
 }
 
@@ -2214,11 +2557,8 @@ function choosePrompt(item: Prompt) {
   selected.value = item
   form.prompt = item.prompt
   form.filename = cleanFilename(item.title) || 'generated'
-  if (item.image_model) form.model = item.image_model
-  if (item.image_size) form.size = item.image_size
-  if (item.image_count) form.count = Math.max(1, Number(item.image_count) || 1)
+  if (!form.model && item.image_model) form.model = item.image_model
   normalizeModel()
-  job.value = null
   settingsOpen.value = true
 }
 
@@ -2260,11 +2600,14 @@ function openGeneratedImage(image: any) {
     id: image.id || String(image.index),
     name: image.output?.split(/[\\/]/).pop() || `生成结果 ${image.index}`,
     bytes: image.bytes || 0,
-    created_at: job.value?.completed_at || new Date().toISOString(),
+    created_at: image.created_at || job.value?.completed_at || new Date().toISOString(),
     url: image.url,
-    prompt: form.prompt,
-    model: job.value?.model || form.model,
-    mode: job.value?.result?.mode,
+    prompt: image.prompt || form.prompt,
+    model: image.model || job.value?.model || form.model,
+    mode: image.mode || job.value?.result?.mode,
+    size: image.size || '',
+    connection_id: image.connection_id || '',
+    connection_name: image.connection_name || '',
     width: image.width,
     height: image.height,
     duration_seconds: image.duration_seconds,
@@ -2307,6 +2650,70 @@ async function copyGuideText(value: string, label: string) {
   }
 }
 
+function persistUpdateStatus() {
+  try {
+    window.localStorage.setItem(updateCacheKey, JSON.stringify({
+      latestVersion: updateStatus.latestVersion,
+      checkedAt: updateStatus.checkedAt,
+    }))
+  } catch {}
+}
+
+function restoreUpdateStatus() {
+  try {
+    const cached = JSON.parse(window.localStorage.getItem(updateCacheKey) || '{}')
+    if (!cached.latestVersion || !cached.checkedAt) return false
+    updateStatus.latestVersion = String(cached.latestVersion)
+    updateStatus.checkedAt = Number(cached.checkedAt)
+    updateStatus.checked = true
+    return Date.now() - updateStatus.checkedAt < updateCacheMaxAge
+  } catch {
+    return false
+  }
+}
+
+function remindAboutUpdate() {
+  if (!updateAvailable.value) return
+  try {
+    if (window.localStorage.getItem(updateNoticeKey) === updateStatus.latestVersion) return
+    window.localStorage.setItem(updateNoticeKey, updateStatus.latestVersion)
+  } catch {}
+  showToast('info', `发现新版本 ${updateStatus.latestVersion}，点击顶部“更新”查看`)
+}
+
+async function checkForUpdates(notify = false) {
+  if (updateStatus.checking) return
+  updateStatus.checking = true
+  updateStatus.error = ''
+  try {
+    const response = await fetch(updateCheckUrl, {
+      headers: { Accept: 'application/vnd.github+json' },
+      credentials: 'omit',
+    })
+    if (!response.ok) throw new Error(`GitHub 返回 HTTP ${response.status}`)
+    const latestVersion = latestVersionTag(await response.json())
+    if (!latestVersion) throw new Error('仓库中没有可识别的版本标签')
+    updateStatus.latestVersion = latestVersion
+    updateStatus.checkedAt = Date.now()
+    updateStatus.checked = true
+    persistUpdateStatus()
+    if (!notify) remindAboutUpdate()
+    if (notify) {
+      showToast(updateAvailable.value ? 'info' : 'success', updateAvailable.value ? `发现新版本 ${latestVersion}` : '当前已是最新版本')
+    }
+  } catch (error: any) {
+    updateStatus.error = error?.message || '无法连接 GitHub'
+    if (notify) showToast('error', `检查更新失败：${updateStatus.error}`)
+  } finally {
+    updateStatus.checking = false
+  }
+}
+
+async function openUpdateCenter() {
+  await scrollGuideTo('guide-update')
+  if (!updateStatus.checked && !updateStatus.checking) void checkForUpdates(false)
+}
+
 async function scrollGuideTo(id: string) {
   if (activeView.value !== 'guide') await switchView('guide')
   await nextTick()
@@ -2335,7 +2742,10 @@ function cleanFilename(value: string) {
 }
 
 function normalizeModel() {
-  if (isGemini.value) form.size = ''
+  if (isGemini.value) {
+    form.size = ''
+    closeSizePicker()
+  }
   form.concurrency = serialModel.value ? 1 : Math.max(1, Number(form.count) || 1)
 }
 
@@ -2371,11 +2781,24 @@ async function createJob() {
       showToast('warning', '请先为当前连接配置 API Key')
       return
     }
+    if (!form.model) {
+      openConnection()
+      showToast('warning', '请先同步并选择一个生成模型')
+      return
+    }
     submitting.value = true
     const count = Math.max(1, Number(form.count) || 1)
     const concurrency = Math.max(1, Number(form.concurrency) || 1)
     if (concurrency > count) throw new Error('并发数不能超过生成数量')
-    const payload = { ...form, connection_id: generationConnection.value.id, count, concurrency, input_image: await fileData(inputFile.value) }
+    form.size = constrainImageSizeValue(form.size)
+    const payload = {
+      ...form,
+      connection_id: generationConnection.value.id,
+      continue_job_id: job.value?.id || '',
+      count,
+      concurrency,
+      input_image: await fileData(inputFile.value),
+    }
     const createdJob: Job = await api('/api/jobs', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -2433,9 +2856,10 @@ function summaryFromJob(value: Job): JobSummary {
     name: value.name || '未命名任务',
     status: value.status,
     created_at: value.created_at,
+    updated_at: value.updated_at || value.completed_at || value.created_at,
     completed_at: value.completed_at,
     model: value.model,
-    count: Number(value.count) || 1,
+    count: Number(value.result?.requested ?? value.count) || 1,
     concurrency: Number(value.concurrency) || 1,
     succeeded: Number(value.result?.succeeded ?? value.succeeded) || 0,
     failed: Number(value.result?.failed ?? value.failed) || 0,
@@ -2447,7 +2871,7 @@ function summaryFromJob(value: Job): JobSummary {
 function upsertJobHistory(value: Job) {
   const summary = summaryFromJob(value)
   jobHistory.value = [summary, ...jobHistory.value.filter((item) => item.id !== summary.id)]
-    .sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)))
+    .sort((left, right) => String(right.updated_at || right.created_at).localeCompare(String(left.updated_at || left.created_at)))
     .slice(0, 50)
   historyTotal.value = Math.max(historyTotal.value, jobHistory.value.length)
 }
@@ -2576,6 +3000,8 @@ function resolveConfirmation(confirmed: boolean) {
 function onKeydown(event: KeyboardEvent) {
   if (event.key !== 'Escape') return
   if (confirmation.value) resolveConfirmation(false)
+  else if (sizePickerOpen.value) closeSizePicker()
+  else if (modelPickerOpen.value) closeModelPicker()
   else if (connectionOpen.value) closeConnection()
   else if (selectedImage.value) closeImageViewer()
   else closeSettings()
@@ -2627,6 +3053,8 @@ onMounted(async () => {
     { rootMargin: '500px 0px' },
   )
   bindObserver()
+  if (restoreUpdateStatus()) remindAboutUpdate()
+  else void checkForUpdates(false)
 })
 
 onUnmounted(() => {

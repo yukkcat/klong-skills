@@ -17,7 +17,7 @@ python <skill-dir>/scripts/prompt_studio.py
 
 Keep the server process running and report the opened local URL. The command binds to `127.0.0.1:8765`, opens the browser, and saves generated files under the shared output directory. Resolution order is `--output-dir`, `KLONG_OUTPUT_DIR`, the location saved in Prompt Studio, then `outputs/prompt-studio` in the launch directory. On the first launch it downloads all built-in prompt sources in the background, then caches them under `~/.klong-image`. Later launches load the cache immediately. Use `--refresh` to force a full update, `--port <port>` when 8765 is occupied by another application, or `--output-dir <path>` to lock the gallery/output directory for that launch. Use `npm run dev` only when explicitly developing the Vue source; it is not the end-user launch path.
 
-Prompt Studio includes multi-connection management, `/v1/models` connection testing, persistent storage-location settings, real image generation, and a paginated gallery. Each connection keeps its own name, API address, encrypted key, synchronized model list, and default model. Users can add, switch, test, update, or delete connections from the local UI, and the creation workspace selects a connection before showing that connection's image models. On Windows, direct Codex generation automatically uses the same active connection even when an environment connection also exists. It indexes supported image files under the shared output directory and records task metadata under its `.klong/jobs` subdirectory. Direct Codex generation and web generation use the same manifest schema, so prompts, models, sizes, timings, failures, per-image details, history items, and gallery entries remain consistent. The gallery supports searching, sorting, configurable page sizes, current-page or all-filtered-result selection, batch ZIP downloads, and confirmed permanent deletion from local disk.
+Prompt Studio includes multi-connection management, `/v1/models` connection testing, persistent storage-location settings, real image generation, a paginated gallery, and a non-blocking GitHub tag update check. Each connection keeps its own name, API address, encrypted key, synchronized model list, and default model. Users can add, switch, test, update, or delete connections from the local UI, and the creation workspace selects a connection before showing that connection's image models. On Windows, direct Codex generation automatically uses the same active connection even when an environment connection also exists. It indexes supported image files under the shared output directory and records task metadata under its `.klong/jobs` subdirectory. Direct Codex generation and web generation use the same manifest schema, so prompts, models, sizes, timings, failures, per-image details, history items, and gallery entries remain consistent. The gallery supports searching, sorting, configurable page sizes, current-page or all-filtered-result selection, batch ZIP downloads, and confirmed permanent deletion from local disk. The update center checks at most once every 12 hours, links to the newest semantic version tag, and copies a Codex update instruction; it never overwrites the running Skill itself.
 
 Keep the server local. Do not change its host binding or expose it through a tunnel. Existing keys are never returned to the browser; only masked hints are shown. On Windows, keys entered in the UI are encrypted with DPAPI for the current user; on other systems they remain in memory for the current process only. `KLONG_API_KEY` and `KLONG_BASE_URL` expose a read-only environment connection alongside UI-managed connections. Generation is delegated to `generate.py` by the local server, and each queued job captures its selected connection so later UI switching cannot change the key used by that job.
 
@@ -111,6 +111,22 @@ Set an explicit OpenAI-compatible size:
 ```shell
 python <skill-dir>/scripts/generate.py --model gpt-image-2 --size 1024x1024 --prompt "A red paper lantern on white" --output outputs/prompt-studio/lantern.png
 ```
+
+Use the same scaling rule as Prompt Studio's ratio/resolution picker. Start with the 1K base size for the requested ratio, then target 2x dimensions for 2K or 4x dimensions for 4K. Before sending a request, proportionally reduce the target when needed so the longest edge does not exceed `3840` pixels and the total does not exceed `8,294,400` pixels. Every listed ratio supports all three tiers, but high tiers may show `upstream limit` and use a smaller actual size:
+
+| Ratio | 1K base `--size` |
+| --- | --- |
+| `1:1` | `1024x1024` |
+| `2:3` | `1024x1536` |
+| `3:2` | `1536x1024` |
+| `3:4` | `1024x1365` |
+| `4:3` | `1365x1024` |
+| `9:16` | `1080x1920` |
+| `16:9` | `1920x1080` |
+
+For example, `2:3` is `1024x1536` at 1K and `2048x3072` at 2K; its 4K target is automatically reduced to a legal size. `16:9` at 4K resolves to `3840x2160`, while `1:1` at 4K resolves to `2880x2880`.
+
+For automatic sizing, omit `--size`. Availability still depends on the selected model and upstream service. The script detects the returned image bytes and uses the matching `.png`, `.jpg`, `.webp`, or `.gif` suffix; the requested output suffix is not treated as a conversion instruction.
 
 For Gemini models, omit `--size`; the script sends the native `generateContent` request and extracts `inlineData`. This applies to both text-to-image and image-to-image requests.
 

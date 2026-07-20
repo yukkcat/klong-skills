@@ -1,5 +1,6 @@
 import { openDB, type IDBPDatabase } from 'idb'
 import JSZip from 'jszip'
+import { constrainImageSizeValue } from './imageSizes'
 
 export type RuntimeMode = 'local' | 'browser'
 
@@ -35,10 +36,14 @@ type StoredImage = {
   model: string
   protocol: string
   mode: string
+  connection_id?: string
+  connection_name?: string
   width?: number
   height?: number
   duration_seconds?: number
   job_id: string
+  batch_id?: string
+  size?: string
 }
 
 type PromptLibrary = {
@@ -63,6 +68,125 @@ function randomId() {
   return crypto.randomUUID().replaceAll('-', '')
 }
 
+function nonnegativeInteger(value: unknown, fallback = 0) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : fallback
+}
+
+function continuationState(job?: Record<string, any>) {
+  if (!job) {
+    const result = { requested: 0, succeeded: 0, failed: 0, duration_seconds: 0, images: [], failures: [], batches: [] }
+    return { result, batches: [] as Array<Record<string, any>> }
+  }
+  const rawResult = job.result && typeof job.result === 'object' ? structuredClone(job.result) : {}
+  const images = Array.isArray(rawResult.images) ? rawResult.images.map((image: any) => ({ ...image })) : []
+  const failures = Array.isArray(rawResult.failures) ? rawResult.failures.map((failure: any) => ({ ...failure })) : []
+  const requested = nonnegativeInteger(rawResult.requested, nonnegativeInteger(job.count, images.length + failures.length))
+  const legacyBatchId = String(job.batch_id || `${job.id || 'legacy'}-initial`)
+  images.forEach((image: Record<string, any>, index: number) => {
+    image.index ||= index + 1
+    image.batch_index ||= index + 1
+    image.batch_id ||= legacyBatchId
+    image.prompt ??= String(job.prompt || '')
+    image.model ??= String(job.model || '')
+    image.size ??= String(job.size || '')
+    image.mode ??= String(rawResult.mode || job.mode || '')
+    image.protocol ??= String(rawResult.protocol || job.protocol || '')
+    image.connection_id ??= String(job.connection_id || '')
+    image.connection_name ??= String(job.connection_name || '')
+    image.created_at ??= String(job.completed_at || job.created_at || '')
+  })
+  let batches = Array.isArray(rawResult.batches) ? rawResult.batches.map((batch: any) => ({ ...batch })) : []
+  if (!batches.length && (requested || images.length || failures.length)) {
+    batches = [{
+      id: legacyBatchId,
+      status: String(job.status || 'completed'),
+      created_at: String(job.created_at || ''),
+      completed_at: String(job.completed_at || ''),
+      prompt: String(job.prompt || ''),
+      model: String(job.model || ''),
+      size: String(job.size || ''),
+      mode: String(rawResult.mode || job.mode || ''),
+      protocol: String(rawResult.protocol || job.protocol || ''),
+      connection_id: String(job.connection_id || ''),
+      connection_name: String(job.connection_name || ''),
+      count: requested,
+      concurrency: nonnegativeInteger(job.concurrency, 1),
+      succeeded: nonnegativeInteger(rawResult.succeeded, images.length),
+      failed: nonnegativeInteger(rawResult.failed, failures.length),
+      duration_seconds: Number(rawResult.duration_seconds || 0),
+    }]
+  }
+  const result = {
+    ...rawResult,
+    requested,
+    succeeded: nonnegativeInteger(rawResult.succeeded, images.length),
+    failed: nonnegativeInteger(rawResult.failed, failures.length),
+    duration_seconds: Number(rawResult.duration_seconds || 0),
+    images,
+    failures,
+    batches,
+  }
+  delete result.current_batch
+  return { result, batches }
+}
+
+function mergeGenerationBatch(
+  previousResult: Record<string, any>,
+  previousBatches: Array<Record<string, any>>,
+  batch: Record<string, any>,
+  batchResult: Record<string, any>,
+  status: string,
+) {
+  const previousImages = Array.isArray(previousResult.images) ? previousResult.images.map((image: any) => ({ ...image })) : []
+  const previousFailures = Array.isArray(previousResult.failures) ? previousResult.failures.map((failure: any) => ({ ...failure })) : []
+  const offset = previousImages.reduce((maximum: number, image: any) => Math.max(maximum, nonnegativeInteger(image.index)), 0)
+  const currentImages = (Array.isArray(batchResult.images) ? batchResult.images : []).map((rawImage: any, index: number) => ({
+    ...rawImage,
+    index: offset + index + 1,
+    batch_index: nonnegativeInteger(rawImage.index, index + 1) || index + 1,
+    batch_id: batch.id,
+    prompt: batch.prompt,
+    model: batch.model,
+    size: batch.size,
+    mode: batchResult.mode || batch.mode || '',
+    protocol: batchResult.protocol || batch.protocol || '',
+    connection_id: batch.connection_id || '',
+    connection_name: batch.connection_name || '',
+    created_at: rawImage.created_at || batch.completed_at || batch.created_at || '',
+  }))
+  const currentFailures = (Array.isArray(batchResult.failures) ? batchResult.failures : []).map((rawFailure: any, index: number) => ({
+    ...rawFailure,
+    index: nonnegativeInteger(rawFailure.index, index + 1) || index + 1,
+    batch_id: batch.id,
+  }))
+  const currentSucceeded = nonnegativeInteger(batchResult.succeeded, currentImages.length)
+  const currentFailed = nonnegativeInteger(batchResult.failed, currentFailures.length)
+  const batchSummary = {
+    ...batch,
+    status,
+    protocol: batchResult.protocol || batch.protocol || '',
+    mode: batchResult.mode || batch.mode || '',
+    succeeded: currentSucceeded,
+    failed: currentFailed,
+    duration_seconds: Number(batchResult.duration_seconds || 0),
+  }
+  return {
+    protocol: batchResult.protocol || batch.protocol || previousResult.protocol || '',
+    mode: batchResult.mode || batch.mode || previousResult.mode || '',
+    model: batch.model,
+    requested: nonnegativeInteger(previousResult.requested) + nonnegativeInteger(batch.count),
+    concurrency: batch.concurrency || 1,
+    succeeded: nonnegativeInteger(previousResult.succeeded, previousImages.length) + currentSucceeded,
+    failed: nonnegativeInteger(previousResult.failed, previousFailures.length) + currentFailed,
+    duration_seconds: Math.round((Number(previousResult.duration_seconds || 0) + Number(batchResult.duration_seconds || 0)) * 10) / 10,
+    images: [...previousImages, ...currentImages],
+    failures: [...previousFailures, ...currentFailures],
+    batches: [...previousBatches.map((item) => ({ ...item })), batchSummary],
+    current_batch: batchSummary,
+  }
+}
+
 function parseBody(options: RequestInit) {
   if (!options.body) return {}
   if (typeof options.body !== 'string') throw new Error('浏览器运行时只接受 JSON 请求')
@@ -84,9 +208,23 @@ function cleanBaseUrl(value: unknown) {
 }
 
 async function responseError(response: Response) {
-  const body = await response.json().catch(() => null)
+  const bytes = new Uint8Array(await response.arrayBuffer())
+  const contentType = response.headers.get('Content-Type') || ''
+  const charset = contentType.match(/charset\s*=\s*["']?([^;\s"']+)/i)?.[1] || ''
+  const encodings = Array.from(new Set([charset, 'utf-8', 'gb18030'].filter(Boolean)))
+  let text = ''
+  for (const encoding of encodings) {
+    try {
+      text = new TextDecoder(encoding, { fatal: true }).decode(bytes)
+      break
+    } catch {}
+  }
+  if (!text) text = new TextDecoder('utf-8').decode(bytes)
+  const body = (() => {
+    try { return JSON.parse(text) } catch { return null }
+  })()
   const message = body?.error?.message || body?.error || body?.message || `HTTP ${response.status}`
-  return new Error(String(message))
+  return new Error(String(message === `HTTP ${response.status}` && text.trim() ? text.trim().slice(0, 1000) : message))
 }
 
 async function dataUrlToBlob(value: string) {
@@ -94,11 +232,19 @@ async function dataUrlToBlob(value: string) {
   return response.blob()
 }
 
-function blobFromBase64(value: string, mime = 'image/png') {
+function imageMimeFromBytes(bytes: Uint8Array, fallback = '') {
+  if (bytes.length >= 8 && [137, 80, 78, 71, 13, 10, 26, 10].every((value, index) => bytes[index] === value)) return 'image/png'
+  if (bytes.length >= 3 && bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) return 'image/jpeg'
+  if (bytes.length >= 12 && String.fromCharCode(...bytes.slice(0, 4)) === 'RIFF' && String.fromCharCode(...bytes.slice(8, 12)) === 'WEBP') return 'image/webp'
+  if (bytes.length >= 6 && ['GIF87a', 'GIF89a'].includes(String.fromCharCode(...bytes.slice(0, 6)))) return 'image/gif'
+  return fallback.startsWith('image/') ? fallback : 'image/png'
+}
+
+function blobFromBase64(value: string, mime = '') {
   const binary = atob(value)
   const bytes = new Uint8Array(binary.length)
   for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
-  return new Blob([bytes], { type: mime })
+  return new Blob([bytes], { type: imageMimeFromBytes(bytes, mime) })
 }
 
 async function imageDimensions(blob: Blob): Promise<{ width?: number; height?: number }> {
@@ -536,11 +682,30 @@ class BrowserRuntime implements StudioRuntime {
     if (!interrupted.length) return
     const transaction = this.db.transaction('jobs', 'readwrite')
     for (const job of interrupted) {
+      const result = job.result && typeof job.result === 'object' ? structuredClone(job.result) : job.result
+      const completedAt = nowIso()
+      const currentBatch = result?.current_batch
+      if (currentBatch) {
+        const missing = Math.max(0, nonnegativeInteger(currentBatch.count) - nonnegativeInteger(currentBatch.succeeded) - nonnegativeInteger(currentBatch.failed))
+        currentBatch.status = 'failed'
+        currentBatch.completed_at = completedAt
+        currentBatch.failed = nonnegativeInteger(currentBatch.failed) + missing
+        result.failed = nonnegativeInteger(result.failed) + missing
+        if (missing) {
+          result.failures = [...(Array.isArray(result.failures) ? result.failures : []), {
+            batch_id: currentBatch.id,
+            error: `页面关闭，${missing} 个请求未完成。`,
+          }]
+        }
+      }
+      if (currentBatch && result?.batches?.length) result.batches[result.batches.length - 1] = { ...currentBatch }
       transaction.store.put({
         ...job,
         status: 'failed',
-        completed_at: nowIso(),
+        updated_at: completedAt,
+        completed_at: completedAt,
         error: '页面在任务完成前关闭，浏览器无法继续后台生成。',
+        result,
       })
     }
     await transaction.done
@@ -562,9 +727,10 @@ class BrowserRuntime implements StudioRuntime {
     const image = result.images?.[0]
     return {
       id: job.id, name: job.name, status: job.status, created_at: job.created_at,
+      updated_at: job.updated_at || job.completed_at || job.created_at,
       completed_at: job.completed_at || '', model: job.model,
       connection_id: job.connection_id, connection_name: job.connection_name,
-      count: job.count, concurrency: job.concurrency,
+      count: result.requested || job.count, concurrency: job.concurrency,
       succeeded: result.succeeded || 0, failed: result.failed || 0,
       duration_seconds: result.duration_seconds || 0,
       thumbnail_url: image?.url || '',
@@ -574,7 +740,7 @@ class BrowserRuntime implements StudioRuntime {
   private async jobHistory(params: URLSearchParams) {
     const limit = Math.min(100, Math.max(1, Number(params.get('limit') || 50)))
     const jobs = await this.db.getAll('jobs') as Array<Record<string, any>>
-    jobs.sort((left, right) => String(right.created_at).localeCompare(String(left.created_at)))
+    jobs.sort((left, right) => String(right.updated_at || right.created_at).localeCompare(String(left.updated_at || left.created_at)))
     const hydrated = await Promise.all(jobs.slice(0, limit).map((job) => this.hydrateJob(job)))
     return { items: hydrated.map((job) => this.summary(job)), total: jobs.length }
   }
@@ -605,36 +771,76 @@ class BrowserRuntime implements StudioRuntime {
     }
     const model = String(payload.model || DEFAULT_MODEL).trim()
     if (SERIAL_MODELS.has(model) && concurrency !== 1) throw new Error(`${model} 仅支持并发数 1`)
+    const size = model.startsWith('gemini-') ? '' : constrainImageSizeValue(String(payload.size || ''))
+    const normalizedPayload = { ...payload, size }
     const { connection } = await this.resolveConnection(payload.connection_id)
-    const job = {
+    const continueJobId = String(payload.continue_job_id || '').trim()
+    if (continueJobId && !/^[A-Za-z0-9_-]{1,80}$/.test(continueJobId)) throw new Error('任务 ID 无效')
+    const previousJob = continueJobId
+      ? await this.db.get('jobs', continueJobId) as Record<string, any> | undefined
+      : undefined
+    if (continueJobId && !previousJob) throw new Error('要继续的任务不存在')
+    if (continueJobId && (this.activeJobs.has(continueJobId) || ['queued', 'running'].includes(String(previousJob?.status)))) {
+      throw new Error('当前任务仍在生成，请完成后再追加')
+    }
+    const { result: previousResult, batches: previousBatches } = continuationState(previousJob)
+    const createdAt = nowIso()
+    const batch = {
       id: randomId().slice(0, 16),
-      name: String(payload.filename || '').trim() || '创作任务',
       status: 'queued',
-      created_at: nowIso(),
+      created_at: createdAt,
+      completed_at: '',
+      prompt,
+      model,
+      size,
+      mode: payload.input_image ? 'image-to-image' : 'text-to-image',
+      protocol: String(payload.protocol || ''),
+      connection_id: connection.id,
+      connection_name: connection.name,
+      count,
+      concurrency,
+    }
+    const job = {
+      id: continueJobId || randomId().slice(0, 16),
+      batch_id: batch.id,
+      name: String(previousJob?.name || payload.filename || '').trim() || '创作任务',
+      status: 'queued',
+      created_at: previousJob?.created_at || createdAt,
+      updated_at: createdAt,
+      completed_at: '',
       prompt,
       model,
       connection_id: connection.id,
       connection_name: connection.name,
       protocol: String(payload.protocol || ''),
-      mode: payload.input_image ? 'image-to-image' : 'text-to-image',
-      size: String(payload.size || ''),
+      mode: batch.mode,
+      size,
       count,
       concurrency,
       progress: [],
-      result: null,
+      result: mergeGenerationBatch(previousResult, previousBatches, batch, {}, 'queued'),
       error: '',
     }
     await this.db.put('jobs', job)
     this.activeJobs.add(job.id)
-    void this.runJob(job.id, payload).finally(() => this.activeJobs.delete(job.id))
+    void this.runJob(job.id, normalizedPayload, previousResult, previousBatches, batch).finally(() => this.activeJobs.delete(job.id))
     return job
   }
 
-  private async runJob(jobId: string, payload: Record<string, any>) {
+  private async runJob(
+    jobId: string,
+    payload: Record<string, any>,
+    previousResult: Record<string, any>,
+    previousBatches: Array<Record<string, any>>,
+    batch: Record<string, any>,
+  ) {
     const started = performance.now()
     const job = await this.db.get('jobs', jobId) as Record<string, any>
     job.status = 'running'
     job.started_at = nowIso()
+    job.updated_at = job.started_at
+    if (job.result?.batches?.length) job.result.batches[job.result.batches.length - 1].status = 'running'
+    if (job.result?.current_batch) job.result.current_batch.status = 'running'
     await this.db.put('jobs', job)
     const images: Array<Record<string, any>> = []
     const failures: Array<Record<string, any>> = []
@@ -650,7 +856,8 @@ class BrowserRuntime implements StudioRuntime {
           const dimensions = await imageDimensions(generated.blob)
           const extension = generated.blob.type.includes('jpeg') ? 'jpg' : generated.blob.type.includes('webp') ? 'webp' : 'png'
           const stem = String(payload.filename || 'generated').replace(/[\\/:*?"<>|]+/g, '-').trim().slice(0, 60) || 'generated'
-          const name = total === 1 ? `${stem}.${extension}` : `${stem}-${String(index).padStart(3, '0')}.${extension}`
+          const uniqueStem = `${stem}-${String(batch.id).slice(0, 8)}`
+          const name = total === 1 ? `${uniqueStem}.${extension}` : `${uniqueStem}-${String(index).padStart(3, '0')}.${extension}`
           const imageId = randomId()
           const duration = Math.round((performance.now() - requestStarted) / 100) / 10
           const stored: StoredImage = {
@@ -663,15 +870,19 @@ class BrowserRuntime implements StudioRuntime {
             model: job.model,
             protocol: generated.protocol,
             mode: payload.input_image ? 'image-to-image' : 'text-to-image',
+            connection_id: batch.connection_id,
+            connection_name: batch.connection_name,
             ...dimensions,
             duration_seconds: duration,
             job_id: jobId,
+            batch_id: batch.id,
+            size: batch.size,
           }
           await this.db.put('images', stored)
           images.push({
             index, status: 'success', duration_seconds: duration, attempts: generated.attempts,
             bytes: stored.bytes, width: stored.width, height: stored.height,
-            output: name, id: imageId,
+            output: name, id: imageId, created_at: stored.created_at,
           })
         } catch (error: any) {
           failures.push({
@@ -680,7 +891,9 @@ class BrowserRuntime implements StudioRuntime {
           })
         }
         const current = await this.db.get('jobs', jobId) as Record<string, any>
-        current.result = this.jobResult(job, images, failures, started)
+        const runningBatch = { ...batch, status: 'running' }
+        current.result = mergeGenerationBatch(previousResult, previousBatches, runningBatch, this.batchResult(job, images, failures, started), 'running')
+        current.updated_at = nowIso()
         await this.db.put('jobs', current)
       }
     }
@@ -688,22 +901,30 @@ class BrowserRuntime implements StudioRuntime {
     try {
       await Promise.all(Array.from({ length: Math.min(job.concurrency, total) }, () => worker()))
       const current = await this.db.get('jobs', jobId) as Record<string, any>
-      current.status = failures.length ? 'failed' : 'completed'
-      current.completed_at = nowIso()
+      const status = failures.length ? 'failed' : 'completed'
+      const completedAt = nowIso()
+      const completedBatch = { ...batch, status, completed_at: completedAt }
+      current.status = status
+      current.updated_at = completedAt
+      current.completed_at = completedAt
       current.error = failures.map((failure) => failure.error).join('; ').slice(0, 1000)
-      current.result = this.jobResult(job, images, failures, started)
+      current.result = mergeGenerationBatch(previousResult, previousBatches, completedBatch, this.batchResult(job, images, failures, started), status)
       await this.db.put('jobs', current)
     } catch (error: any) {
       const current = await this.db.get('jobs', jobId) as Record<string, any>
+      const completedAt = nowIso()
+      const completedBatch = { ...batch, status: 'failed', completed_at: completedAt }
       current.status = 'failed'
-      current.completed_at = nowIso()
+      current.updated_at = completedAt
+      current.completed_at = completedAt
       current.error = String(error?.message || error).slice(0, 1000)
-      current.result = this.jobResult(job, images, failures, started)
+      const failed = [...failures, { error: current.error }]
+      current.result = mergeGenerationBatch(previousResult, previousBatches, completedBatch, this.batchResult(job, images, failed, started), 'failed')
       await this.db.put('jobs', current)
     }
   }
 
-  private jobResult(job: Record<string, any>, images: Array<Record<string, any>>, failures: Array<Record<string, any>>, started: number) {
+  private batchResult(job: Record<string, any>, images: Array<Record<string, any>>, failures: Array<Record<string, any>>, started: number) {
     return {
       protocol: job.model.startsWith('gemini-') ? 'gemini' : 'openai',
       mode: job.mode,

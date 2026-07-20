@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import hashlib
 import html
 import ipaddress
@@ -45,6 +46,7 @@ from connection_store import (
     validate_base_url,
 )
 from generation_manifest import record_generation_manifest
+from image_sizes import constrain_image_size
 
 
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
@@ -79,6 +81,158 @@ def clean(value: object) -> str:
 def clean_multiline(value: object) -> str:
     text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
     return "\n".join(line.rstrip() for line in text.splitlines()).strip()
+
+
+def job_output_stem(value: object, job_id: str) -> str:
+    fallback = f"image-{job_id}"
+    base = re.sub(r"[^A-Za-z0-9._-]+", "-", clean(value) or fallback)[:64].strip(".-") or fallback
+    suffix = re.sub(r"[^A-Za-z0-9_-]+", "", job_id)[:8] or secrets.token_hex(4)
+    return f"{base}-{suffix}"
+
+
+def _nonnegative_int(value: object, default: int = 0) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def continuation_result(job: dict[str, Any] | None) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Normalize an existing job so a new generation batch can be appended safely."""
+    if not job:
+        return {
+            "requested": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "duration_seconds": 0,
+            "images": [],
+            "failures": [],
+            "batches": [],
+        }, []
+
+    raw_result = job.get("result") if isinstance(job.get("result"), dict) else {}
+    result = copy.deepcopy(raw_result)
+    images = [dict(image) for image in result.get("images", []) if isinstance(image, dict)]
+    failures = [dict(failure) for failure in result.get("failures", []) if isinstance(failure, dict)]
+    requested = _nonnegative_int(result.get("requested"), _nonnegative_int(job.get("count"), len(images) + len(failures)))
+    legacy_batch_id = clean(job.get("batch_id")) or f"{clean(job.get('id')) or 'legacy'}-initial"
+    for position, image in enumerate(images, 1):
+        image.setdefault("index", position)
+        image.setdefault("batch_index", position)
+        image.setdefault("batch_id", legacy_batch_id)
+        image.setdefault("prompt", clean_multiline(job.get("prompt")))
+        image.setdefault("model", clean(job.get("model")))
+        image.setdefault("size", clean(job.get("size")))
+        image.setdefault("mode", clean(result.get("mode") or job.get("mode")))
+        image.setdefault("protocol", clean(result.get("protocol") or job.get("protocol")))
+        image.setdefault("connection_id", clean(job.get("connection_id")))
+        image.setdefault("connection_name", clean(job.get("connection_name")))
+        image.setdefault("created_at", job.get("completed_at") or job.get("created_at", ""))
+
+    batches = [dict(batch) for batch in result.get("batches", []) if isinstance(batch, dict)]
+    if not batches and (requested or images or failures):
+        batches = [{
+            "id": legacy_batch_id,
+            "status": clean(job.get("status")) or "completed",
+            "created_at": job.get("created_at", ""),
+            "completed_at": job.get("completed_at", ""),
+            "prompt": clean_multiline(job.get("prompt")),
+            "model": clean(job.get("model")),
+            "size": clean(job.get("size")),
+            "mode": clean(result.get("mode") or job.get("mode")),
+            "protocol": clean(result.get("protocol") or job.get("protocol")),
+            "connection_id": clean(job.get("connection_id")),
+            "connection_name": clean(job.get("connection_name")),
+            "count": requested,
+            "concurrency": _nonnegative_int(job.get("concurrency"), 1),
+            "succeeded": _nonnegative_int(result.get("succeeded"), len(images)),
+            "failed": _nonnegative_int(result.get("failed"), len(failures)),
+            "duration_seconds": result.get("duration_seconds", 0),
+        }]
+
+    result.update({
+        "requested": requested,
+        "succeeded": _nonnegative_int(result.get("succeeded"), len(images)),
+        "failed": _nonnegative_int(result.get("failed"), len(failures)),
+        "duration_seconds": result.get("duration_seconds", 0) or 0,
+        "images": images,
+        "failures": failures,
+        "batches": batches,
+    })
+    result.pop("current_batch", None)
+    return result, batches
+
+
+def merge_generation_batch(
+    previous_result: dict[str, Any],
+    previous_batches: list[dict[str, Any]],
+    batch: dict[str, Any],
+    batch_result: dict[str, Any] | None,
+    status: str,
+) -> dict[str, Any]:
+    """Append one batch while preserving image-level generation metadata."""
+    current = copy.deepcopy(batch_result) if isinstance(batch_result, dict) else {}
+    previous_images = [dict(image) for image in previous_result.get("images", []) if isinstance(image, dict)]
+    previous_failures = [dict(failure) for failure in previous_result.get("failures", []) if isinstance(failure, dict)]
+    offset = max((_nonnegative_int(image.get("index")) for image in previous_images), default=0)
+
+    current_images = []
+    for position, raw_image in enumerate(current.get("images", []), 1):
+        if not isinstance(raw_image, dict):
+            continue
+        image = dict(raw_image)
+        local_index = _nonnegative_int(image.get("index"), position) or position
+        image.update({
+            "index": offset + position,
+            "batch_index": local_index,
+            "batch_id": batch["id"],
+            "prompt": batch["prompt"],
+            "model": batch["model"],
+            "size": batch["size"],
+            "mode": current.get("mode") or batch.get("mode", ""),
+            "protocol": current.get("protocol") or batch.get("protocol", ""),
+            "connection_id": batch.get("connection_id", ""),
+            "connection_name": batch.get("connection_name", ""),
+            "created_at": image.get("created_at") or batch.get("completed_at") or batch.get("created_at", ""),
+        })
+        current_images.append(image)
+
+    current_failures = []
+    for position, raw_failure in enumerate(current.get("failures", []), 1):
+        if not isinstance(raw_failure, dict):
+            continue
+        failure = dict(raw_failure)
+        failure.setdefault("index", position)
+        failure["batch_id"] = batch["id"]
+        current_failures.append(failure)
+
+    current_succeeded = _nonnegative_int(current.get("succeeded"), len(current_images))
+    current_failed = _nonnegative_int(current.get("failed"), len(current_failures))
+    batch_summary = {
+        **batch,
+        "status": status,
+        "completed_at": batch.get("completed_at", ""),
+        "protocol": current.get("protocol") or batch.get("protocol", ""),
+        "mode": current.get("mode") or batch.get("mode", ""),
+        "succeeded": current_succeeded,
+        "failed": current_failed,
+        "duration_seconds": current.get("duration_seconds", 0) or 0,
+    }
+    batches = [copy.deepcopy(item) for item in previous_batches] + [batch_summary]
+    return {
+        "protocol": current.get("protocol") or batch.get("protocol") or previous_result.get("protocol", ""),
+        "mode": current.get("mode") or batch.get("mode") or previous_result.get("mode", ""),
+        "model": batch["model"],
+        "requested": _nonnegative_int(previous_result.get("requested")) + _nonnegative_int(batch.get("count")),
+        "concurrency": batch.get("concurrency", 1),
+        "succeeded": _nonnegative_int(previous_result.get("succeeded"), len(previous_images)) + current_succeeded,
+        "failed": _nonnegative_int(previous_result.get("failed"), len(previous_failures)) + current_failed,
+        "duration_seconds": round(float(previous_result.get("duration_seconds", 0) or 0) + float(current.get("duration_seconds", 0) or 0), 3),
+        "images": previous_images + current_images,
+        "failures": previous_failures + current_failures,
+        "batches": batches,
+        "current_batch": batch_summary,
+    }
 
 
 def validate_output_directory(value: object) -> Path:
@@ -738,6 +892,8 @@ class Settings:
             raise ValueError("请先填写 API Key")
         environment = os.environ.copy()
         environment["KLONG_API_KEY"] = api_key
+        environment["PYTHONIOENCODING"] = "utf-8"
+        environment["PYTHONUTF8"] = "1"
         command = [sys.executable, str(GENERATE_SCRIPT), "--list-models", "--base-url", base_url, "--timeout", "30", "--no-progress"]
         try:
             completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", env=environment, timeout=35, check=False)
@@ -843,6 +999,9 @@ class Gallery:
                 "model": clean(detail.get("model")),
                 "protocol": clean(detail.get("protocol")),
                 "mode": clean(detail.get("mode")),
+                "size": clean(detail.get("size")),
+                "connection_id": clean(detail.get("connection_id")),
+                "connection_name": clean(detail.get("connection_name")),
                 "width": detail.get("width"),
                 "height": detail.get("height"),
                 "duration_seconds": detail.get("duration_seconds"),
@@ -1031,17 +1190,22 @@ class Gallery:
         result = {
             "protocol": clean(data.get("protocol")),
             "mode": clean(data.get("mode")),
+            "model": clean(data.get("model")),
+            "requested": int(data.get("requested", data.get("count", max(1, len(images)))) or 1),
             "succeeded": int(data.get("succeeded", len(images)) or 0),
             "failed": int(data.get("failed", 0) or 0),
             "duration_seconds": duration,
             "images": images,
             "failures": data.get("failures", []),
+            "batches": data.get("batches", []),
+            "current_batch": data.get("current_batch"),
         }
         return {
             "id": job_id,
             "name": clean(data.get("name")) or f"历史任务 {job_id[:6]}",
             "status": clean(data.get("status")) or "completed",
             "created_at": data.get("created_at", ""),
+            "updated_at": data.get("updated_at") or data.get("completed_at") or data.get("created_at", ""),
             "started_at": data.get("started_at", ""),
             "completed_at": data.get("completed_at", ""),
             "prompt": clean_multiline(data.get("prompt")),
@@ -1135,33 +1299,88 @@ class Jobs:
         model = clean(payload.get("model") or "gpt-image-2")
         if model in {"gpt-image-2-codex", "gpt-image-2-vip"} and concurrency != 1:
             raise ValueError(f"{model} only supports concurrency 1")
-        job_id = secrets.token_hex(8)
+
+        continue_job_id = clean(payload.get("continue_job_id"))
+        if continue_job_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", continue_job_id):
+            raise ValueError("invalid task id")
+        with self.lock:
+            active = self.jobs.get(continue_job_id) if continue_job_id else None
+            if active and active.get("status") in {"queued", "running"}:
+                raise ValueError("当前任务仍在生成，请完成后再追加")
+        previous_job = self.get(continue_job_id) if continue_job_id else None
+        if continue_job_id and not previous_job:
+            raise ValueError("要继续的任务不存在")
+
+        previous_result, previous_batches = continuation_result(previous_job)
+        job_id = continue_job_id or secrets.token_hex(8)
+        batch_id = secrets.token_hex(8)
+        created_at = now_iso()
+        mode = "image-to-image" if payload.get("input_image") else "text-to-image"
+        size = clean(payload.get("size"))
+        requested_protocol = clean(payload.get("protocol"))
+        if size and requested_protocol != "gemini" and not model.startswith("gemini-"):
+            size, _ = constrain_image_size(size)
+        else:
+            size = ""
+        payload = {**payload, "size": size}
+        batch = {
+            "id": batch_id,
+            "status": "queued",
+            "created_at": created_at,
+            "completed_at": "",
+            "prompt": prompt,
+            "model": model,
+            "size": size,
+            "mode": mode,
+            "protocol": clean(payload.get("protocol")),
+            "connection_id": connection["id"],
+            "connection_name": connection["name"],
+            "count": count,
+            "concurrency": concurrency,
+        }
+        queued_result = merge_generation_batch(previous_result, previous_batches, batch, {}, "queued")
         job = {
             "id": job_id,
-            "name": clean(payload.get("filename")) or f"创作任务 {job_id[:6]}",
+            "batch_id": batch_id,
+            "name": clean(previous_job.get("name")) if previous_job else clean(payload.get("filename")) or f"创作任务 {job_id[:6]}",
             "status": "queued",
-            "created_at": now_iso(),
+            "created_at": previous_job.get("created_at") if previous_job else created_at,
+            "updated_at": created_at,
+            "completed_at": "",
             "prompt": prompt,
             "model": model,
             "connection_id": connection["id"],
             "connection_name": connection["name"],
             "protocol": clean(payload.get("protocol")),
-            "size": clean(payload.get("size")),
+            "mode": mode,
+            "size": size,
             "count": count,
             "concurrency": concurrency,
             "progress": [],
-            "result": None,
+            "result": queued_result,
             "error": "",
         }
         with self.lock:
             self.jobs[job_id] = job
-        threading.Thread(target=self.run, args=(job_id, payload, connection), daemon=True).start()
-        return dict(job)
+        threading.Thread(
+            target=self.run,
+            args=(job_id, payload, connection, previous_result, previous_batches, batch),
+            daemon=True,
+        ).start()
+        return copy.deepcopy(job)
 
-    def run(self, job_id: str, payload: dict[str, Any], connection: dict[str, str]) -> None:
+    def run(
+        self,
+        job_id: str,
+        payload: dict[str, Any],
+        connection: dict[str, str],
+        previous_result: dict[str, Any],
+        previous_batches: list[dict[str, Any]],
+        batch: dict[str, Any],
+    ) -> None:
         job = self.jobs[job_id]
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        stem = re.sub(r"[^A-Za-z0-9._-]+", "-", clean(payload.get("filename") or f"image-{job_id}"))[:80].strip(".-") or f"image-{job_id}"
+        stem = job_output_stem(payload.get("filename"), batch["id"])
         output = self.output_dir / f"{stem}.png"
         command = [
             sys.executable,
@@ -1169,19 +1388,34 @@ class Jobs:
             "--model", job["model"],
             "--prompt", str(payload["prompt"]),
             "--output", str(output),
-            "--count", str(job["count"]),
-            "--concurrency", str(job["concurrency"]),
-            "--job-id", job["id"],
+            "--count", str(batch["count"]),
+            "--concurrency", str(batch["concurrency"]),
+            "--job-id", batch["id"],
             "--name", job["name"],
             "--gallery-dir", str(self.output_dir),
             "--connection-id", job["connection_id"],
             "--connection-name", job["connection_name"],
+            "--no-history",
         ]
         protocol, size = clean(payload.get("protocol")), clean(payload.get("size"))
         if protocol in {"openai", "gemini"}:
             command += ["--protocol", protocol]
         if size and protocol != "gemini" and not job["model"].startswith("gemini-"):
             command += ["--size", size]
+
+        def finish(batch_result: dict[str, Any], status: str, error: str = "") -> None:
+            completed_at = now_iso()
+            completed_batch = {**batch, "status": status, "completed_at": completed_at}
+            merged = merge_generation_batch(previous_result, previous_batches, completed_batch, batch_result, status)
+            job.update(
+                status=status,
+                updated_at=completed_at,
+                completed_at=completed_at,
+                result=merged,
+                error=error[:1000],
+            )
+            job["result"] = self.gallery.record_job(job, payload, merged)
+
         temp_path = None
         image_data = payload.get("input_image")
         if image_data:
@@ -1195,15 +1429,25 @@ class Jobs:
                 handle.write(content); handle.close(); temp_path = handle.name
                 command += ["--input-image", temp_path]
             except (ValueError, TypeError) as exc:
-                job.update(status="failed", completed_at=now_iso(), error=f"Invalid input image: {exc}")
-                job["result"] = self.gallery.record_job(job, payload, {})
+                message = f"Invalid input image: {exc}"
+                finish({"failed": batch["count"], "failures": [{"error": message}]}, "failed", message)
                 return
-        job.update(status="running", started_at=now_iso())
+
+        started_at = now_iso()
+        job.update(status="running", started_at=started_at, updated_at=started_at)
+        running_result = copy.deepcopy(job["result"])
+        if running_result.get("batches"):
+            running_result["batches"][-1]["status"] = "running"
+        if running_result.get("current_batch"):
+            running_result["current_batch"]["status"] = "running"
+        job["result"] = running_result
         try:
             environment = os.environ.copy()
             environment["KLONG_API_KEY"] = connection["api_key"]
             environment["KLONG_BASE_URL"] = connection["base_url"]
             environment["KLONG_DEFAULT_MODEL"] = connection["default_model"]
+            environment["PYTHONIOENCODING"] = "utf-8"
+            environment["PYTHONUTF8"] = "1"
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=environment)
             assert process.stderr is not None
             for line in process.stderr:
@@ -1218,25 +1462,28 @@ class Jobs:
                     result = None
             except (ValueError, IndexError):
                 result = None
-            job["completed_at"] = now_iso()
             result_error = ""
             if result and result.get("failures"):
                 result_error = "; ".join(clean(item.get("error")) for item in result["failures"] if clean(item.get("error")))
-            job.update(status="completed" if return_code == 0 else "failed", result=result or {}, error="" if return_code == 0 else (result_error or stdout.strip() or "Generation failed")[:1000])
-            job["result"] = self.gallery.record_job(job, payload, job["result"])
+            if result is None:
+                result = {"failed": batch["count"], "failures": [{"error": stdout.strip() or "Generation failed"}]}
+            finish(
+                result,
+                "completed" if return_code == 0 else "failed",
+                "" if return_code == 0 else (result_error or stdout.strip() or "Generation failed"),
+            )
         except OSError as exc:
-            job.update(status="failed", completed_at=now_iso(), error=str(exc))
             try:
-                job["result"] = self.gallery.record_job(job, payload, {})
+                finish({"failed": batch["count"], "failures": [{"error": str(exc)}]}, "failed", str(exc))
             except OSError:
-                job["result"] = {}
+                job.update(status="failed", updated_at=now_iso(), completed_at=now_iso(), error=str(exc))
         finally:
             if temp_path:
                 Path(temp_path).unlink(missing_ok=True)
 
     def get(self, job_id: str) -> dict[str, Any] | None:
         with self.lock:
-            current = dict(self.jobs[job_id]) if job_id in self.jobs else None
+            current = copy.deepcopy(self.jobs[job_id]) if job_id in self.jobs else None
         return current or self.gallery.historical_job(job_id)
 
     @staticmethod
@@ -1249,11 +1496,12 @@ class Jobs:
             "name": job.get("name", ""),
             "status": job.get("status", ""),
             "created_at": job.get("created_at", ""),
+            "updated_at": job.get("updated_at") or job.get("completed_at") or job.get("created_at", ""),
             "completed_at": job.get("completed_at", ""),
             "model": job.get("model", ""),
             "connection_id": job.get("connection_id", ""),
             "connection_name": job.get("connection_name", ""),
-            "count": job.get("count", 1),
+            "count": result.get("requested", job.get("count", 1)),
             "concurrency": job.get("concurrency", 1),
             "succeeded": result.get("succeeded", 0),
             "failed": result.get("failed", 0),
@@ -1266,8 +1514,8 @@ class Jobs:
             raise ValueError("history limit must be 1-100")
         merged = {job["id"]: job for job in self.gallery.historical_jobs()}
         with self.lock:
-            merged.update({job_id: dict(job) for job_id, job in self.jobs.items()})
-        jobs = sorted(merged.values(), key=lambda job: str(job.get("created_at", "")), reverse=True)
+            merged.update({job_id: copy.deepcopy(job) for job_id, job in self.jobs.items()})
+        jobs = sorted(merged.values(), key=lambda job: str(job.get("updated_at") or job.get("created_at", "")), reverse=True)
         return {"items": [self._summary(job) for job in jobs[:limit]], "total": len(jobs)}
 
     def delete_history(self, job_id: str) -> dict[str, Any]:

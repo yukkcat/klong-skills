@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import random
+import re
 import secrets
 import struct
 import sys
@@ -22,6 +23,7 @@ from typing import BinaryIO
 
 from connection_store import resolve_cli_connection, resolve_output_directory, validate_base_url
 from generation_manifest import now_iso, record_generation_manifest, validate_job_id
+from image_sizes import constrain_image_size
 
 
 OPENAI_MODELS = {
@@ -139,6 +141,44 @@ def read_limited(stream: BinaryIO, limit: int = MAX_RESPONSE_BYTES) -> bytes:
     return content
 
 
+def decode_response_text(content: bytes, headers: object | None = None) -> str:
+    """Decode API text while tolerating Chinese upstreams that omit or mislabel charset."""
+    if not content:
+        return ""
+    encodings: list[str] = []
+    if headers is not None:
+        try:
+            charset = headers.get_content_charset()  # type: ignore[attr-defined]
+        except (AttributeError, LookupError, TypeError):
+            charset = None
+        if not charset:
+            try:
+                content_type = str(headers.get("Content-Type", ""))  # type: ignore[attr-defined]
+            except (AttributeError, TypeError):
+                content_type = ""
+            match = re.search(r"charset\s*=\s*[\"']?([^;\s\"']+)", content_type, flags=re.IGNORECASE)
+            charset = match.group(1) if match else None
+        if charset:
+            encodings.append(str(charset).strip())
+    encodings.extend(("utf-8-sig", "gb18030"))
+
+    unique_encodings = list(dict.fromkeys(encoding.lower() for encoding in encodings if encoding))
+    for encoding in unique_encodings:
+        try:
+            return content.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+
+    decoded_candidates = []
+    for encoding in unique_encodings or ["utf-8"]:
+        try:
+            decoded = content.decode(encoding, errors="replace")
+        except LookupError:
+            continue
+        decoded_candidates.append(decoded)
+    return min(decoded_candidates, key=lambda value: value.count("\ufffd"), default=content.decode("utf-8", errors="replace"))
+
+
 def validate_image(content: bytes) -> None:
     signatures = (
         b"\x89PNG\r\n\x1a\n",
@@ -149,6 +189,27 @@ def validate_image(content: bytes) -> None:
     is_webp = len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP"
     if not is_webp and not any(content.startswith(signature) for signature in signatures):
         raise RuntimeError("The API response is not a supported PNG, JPEG, GIF, or WebP image")
+
+
+def output_image_mime(content: bytes, fallback: str = "") -> str:
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    normalized = str(fallback or "").split(";", 1)[0].strip().lower()
+    return normalized if normalized.startswith("image/") else "application/octet-stream"
+
+
+def image_extension(mime_type: str) -> str:
+    return {
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+    }.get(str(mime_type).split(";", 1)[0].lower(), ".png")
 
 
 def input_image_mime(content: bytes) -> str:
@@ -222,9 +283,9 @@ def request_multipart(url: str, api_key: str, body: bytes, boundary: str, timeou
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(read_limited(response).decode("utf-8"))
+            return json.loads(decode_response_text(read_limited(response), response.headers))
     except urllib.error.HTTPError as exc:
-        detail = exc.read(1001).decode("utf-8", errors="replace")
+        detail = decode_response_text(exc.read(4096), exc.headers)
         error = f"HTTP {exc.code}: {detail[:1000]}"
         if exc.code == 429 or 500 <= exc.code <= 599:
             raise TransientError(error) from exc
@@ -238,9 +299,9 @@ def request_json(url: str, headers: dict[str, str], payload: dict | None, timeou
     request = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT, **headers}, method="GET" if data is None else "POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            return json.loads(read_limited(response).decode("utf-8"))
+            return json.loads(decode_response_text(read_limited(response), response.headers))
     except urllib.error.HTTPError as exc:
-        detail = exc.read(1001).decode("utf-8", errors="replace")
+        detail = decode_response_text(exc.read(4096), exc.headers)
         error = f"HTTP {exc.code}: {detail[:1000]}"
         if exc.code == 429 or 500 <= exc.code <= 599:
             raise TransientError(error) from exc
@@ -290,7 +351,8 @@ def generate_openai(base_url: str, api_key: str, args: argparse.Namespace) -> tu
         raise RuntimeError("OpenAI-compatible response did not contain data[0]")
     item = items[0]
     if item.get("b64_json"):
-        return base64.b64decode(item["b64_json"]), "image/png"
+        content = base64.b64decode(item["b64_json"])
+        return content, output_image_mime(content, "image/png")
     if item.get("url"):
         image_url = item["url"]
         if not isinstance(image_url, str) or not image_url.lower().startswith(("https://", "http://")):
@@ -343,7 +405,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", help="Image prompt. Required unless --check or --list-models is used.")
     parser.add_argument(
         "--output",
-        help="Output image path. Defaults to a unique PNG under the shared local gallery directory.",
+        help="Output image path. The suffix is adjusted to the actual PNG, JPEG, WebP, or GIF response format.",
     )
     parser.add_argument("--name", help="Task name shown in local studio history. Defaults to the output filename.")
     parser.add_argument("--job-id", help="Stable task ID used by local studio history.")
@@ -420,6 +482,11 @@ def configure_runtime(args: argparse.Namespace, connection: dict[str, str]) -> N
         raise ValueError(f"{args.model} only supports --concurrency 1")
     if args.protocol == "gemini" and args.size:
         raise ValueError("--size is only supported for OpenAI-compatible models")
+    args.requested_size = args.size or ""
+    if args.size:
+        args.size, args.size_limited = constrain_image_size(args.size)
+    else:
+        args.size_limited = False
 
 
 def main() -> int:
@@ -455,6 +522,8 @@ def main() -> int:
         started_at = now_iso()
         progress = ProgressReporter(not args.no_progress, args.count)
         progress.start(args.model, args.protocol, mode, args.concurrency, args.timeout)
+        if args.size_limited:
+            progress.emit(f"[size] adjusted requested={args.requested_size} actual={args.size} upstream_limit=true")
         history_manifest = None
         history_enabled = not args.no_history
         if history_enabled:
@@ -530,8 +599,10 @@ def main() -> int:
                 if not image_bytes:
                     raise RuntimeError("The API returned an empty image")
                 validate_image(image_bytes)
+                mime_type = output_image_mime(image_bytes, mime_type)
                 width, height = image_dimensions(image_bytes)
-                item_output = output if args.count == 1 else output.with_name(f"{output.stem}-{index:03d}{output.suffix}")
+                item_base = output if args.count == 1 else output.with_name(f"{output.stem}-{index:03d}{output.suffix}")
+                item_output = item_base.with_suffix(image_extension(mime_type))
                 item_output.write_bytes(image_bytes)
                 duration = time.monotonic() - request_started_at
                 progress.request_completed(index, duration, len(image_bytes), width, height)

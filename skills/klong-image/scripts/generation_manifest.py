@@ -69,6 +69,7 @@ def build_generation_manifest(
         "name": clean(job.get("name")),
         "status": status,
         "created_at": job.get("created_at") or now_iso(),
+        "updated_at": job.get("updated_at") or completed_at or job.get("started_at") or job.get("created_at") or now_iso(),
         "started_at": job.get("started_at", ""),
         "completed_at": completed_at,
         "prompt": clean_multiline(payload.get("prompt")),
@@ -79,6 +80,7 @@ def build_generation_manifest(
         "mode": clean(result.get("mode") or payload.get("mode")),
         "size": clean(payload.get("size")),
         "count": int(job.get("count", 1) or 1),
+        "requested": int(result.get("requested", job.get("count", 1)) or 1),
         "concurrency": int(job.get("concurrency", 1) or 1),
         "succeeded": int(result.get("succeeded", len(images)) or 0),
         "failed": int(result.get("failed", 0) or 0),
@@ -86,6 +88,8 @@ def build_generation_manifest(
         "failures": result.get("failures", []),
         "progress": [str(line) for line in job.get("progress", [])][-80:],
         "error": clean_multiline(job.get("error"))[:1000],
+        "batches": result.get("batches", []),
+        "current_batch": result.get("current_batch"),
         "images": images,
     }
 
