@@ -1821,7 +1821,7 @@ const filteredModelPickerModels = computed(() => {
     ? modelPickerModels.value.filter((model) => model.toLocaleLowerCase().includes(keyword))
     : modelPickerModels.value
 })
-const serialModel = computed(() => ['gpt-image-2-codex', 'gpt-image-2-vip'].includes(form.model))
+const serialModel = computed(() => ['gpt-image-2-vip'].includes(form.model))
 const isGemini = computed(() => String(form.model).startsWith('gemini-'))
 const selectedSizeLabel = computed(() => imageSizeLabel(form.size || 'auto'))
 const sizePickerSelection = computed(() => (

@@ -29,18 +29,20 @@ from image_sizes import constrain_image_size
 OPENAI_MODELS = {
     "gpt-image-2",
     "gpt-image-2-c",
-    "gpt-image-2-codex",
     "gpt-image-2-vip",
 }
 GEMINI_MODELS = {
     "gemini-3-pro-image-preview",
+    "gemini-3-pro-image-preview-c",
     "gemini-3.1-flash-image-preview",
+    "gemini-3.1-flash-image-preview-c",
 }
 DEFAULT_OPENAI_MODEL = "gpt-image-2"
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_INPUT_BYTES = 20 * 1024 * 1024
 USER_AGENT = "klong-image-skill/0.1"
-SERIAL_MODELS = {"gpt-image-2-codex", "gpt-image-2-vip"}
+SUPPORTED_MODELS = OPENAI_MODELS | GEMINI_MODELS
+SERIAL_MODELS = {"gpt-image-2-vip"}
 DEFAULT_OUTPUT_DIR = Path(resolve_output_directory()["path"])
 
 
@@ -317,7 +319,7 @@ def list_models(base_url: str, api_key: str, timeout: int) -> list[str]:
         None,
         timeout,
     )
-    return sorted(item["id"] for item in result.get("data", []) if isinstance(item, dict) and item.get("id"))
+    return sorted(item["id"] for item in result.get("data", []) if isinstance(item, dict) and item.get("id") in SUPPORTED_MODELS)
 
 
 def check_model(base_url: str, api_key: str, model: str, protocol: str, timeout: int) -> None:
@@ -420,10 +422,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input-image", help="PNG, JPEG, or WebP source image for image-to-image editing.")
     parser.add_argument("--size", help="OpenAI-compatible size, for example 1024x1024.")
     parser.add_argument("--base-url", help="Override the API base URL from the active connection.")
-    parser.add_argument("--timeout", type=int, help="Request timeout in seconds. Defaults to 420 for 4K models, otherwise 360.")
+    parser.add_argument("--timeout", type=int, help="Request timeout in seconds. Defaults to 600.")
     parser.add_argument("--count", type=int, default=1, help="Number of images to generate (1-100).")
     parser.add_argument("--concurrency", type=int, default=1, help="Parallel requests (at least 1; effective maximum is --count).")
-    parser.add_argument("--retries", type=int, default=2, help="Retries after a transient failure (0-5).")
+    parser.add_argument("--retries", type=int, default=0, help="Retries after a transient failure (0-5); defaults to 0 to avoid duplicate billing.")
     parser.add_argument("--retry-delay", type=float, default=3, help="Initial retry delay in seconds (0-60).")
     parser.add_argument("--check", action="store_true", help="Check model access without generating an image.")
     parser.add_argument("--list-models", action="store_true", help="List model IDs visible to the current key.")
@@ -474,10 +476,15 @@ def configure_runtime(args: argparse.Namespace, connection: dict[str, str]) -> N
     args.base_url = validate_base_url(args.base_url or connection.get("base_url"))
     args.connection_id = args.connection_id or connection.get("id") or ""
     args.connection_name = args.connection_name or connection.get("name") or ""
+    if args.model not in SUPPORTED_MODELS:
+        raise ValueError(f"Model is not supported by this Skill: {args.model}")
+    expected_protocol = "gemini" if args.model in GEMINI_MODELS else "openai"
     if args.protocol == "auto":
-        args.protocol = "gemini" if args.model in GEMINI_MODELS or args.model.startswith("gemini-") else "openai"
+        args.protocol = expected_protocol
+    elif args.protocol != expected_protocol:
+        raise ValueError(f"{args.model} requires the {expected_protocol} protocol")
     if args.timeout is None:
-        args.timeout = 420 if "4k" in args.model.lower() else 360
+        args.timeout = 600
     if args.model in SERIAL_MODELS and args.concurrency != 1:
         raise ValueError(f"{args.model} only supports --concurrency 1")
     if args.protocol == "gemini" and args.size:

@@ -56,7 +56,9 @@ const DB_NAME = 'klong-prompt-studio'
 const DB_VERSION = 1
 const DEFAULT_BASE_URL = 'https://api.klong.lat'
 const DEFAULT_MODEL = 'gpt-image-2'
-const SERIAL_MODELS = new Set(['gpt-image-2-codex', 'gpt-image-2-vip'])
+const SERIAL_MODELS = new Set(['gpt-image-2-vip'])
+const GEMINI_MODELS = new Set(['gemini-3-pro-image-preview', 'gemini-3-pro-image-preview-c', 'gemini-3.1-flash-image-preview', 'gemini-3.1-flash-image-preview-c'])
+const SUPPORTED_MODELS = new Set(['gpt-image-2', 'gpt-image-2-c', 'gpt-image-2-vip', ...GEMINI_MODELS])
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
@@ -519,7 +521,8 @@ class BrowserRuntime implements StudioRuntime {
     if (!response.ok) throw await responseError(response)
     const data = await response.json()
     const raw = Array.isArray(data) ? data : Array.isArray(data.data) ? data.data : []
-    return [...new Set(raw.map((item: any) => typeof item === 'string' ? item : item?.id).filter(Boolean).map(String))]
+    const models = raw.map((item: any) => typeof item === 'string' ? item : item?.id).filter(Boolean).map(String)
+    return [...new Set<string>(models)].filter((model) => SUPPORTED_MODELS.has(model))
   }
 
   private async testConnection(payload: Record<string, any>) {
@@ -770,6 +773,7 @@ class BrowserRuntime implements StudioRuntime {
       throw new Error('生成数量必须为 1-100，并发数必须在 1 和生成数量之间')
     }
     const model = String(payload.model || DEFAULT_MODEL).trim()
+    if (!SUPPORTED_MODELS.has(model)) throw new Error(`${model} 不是此 Skill 支持的模型`)
     if (SERIAL_MODELS.has(model) && concurrency !== 1) throw new Error(`${model} 仅支持并发数 1`)
     const size = model.startsWith('gemini-') ? '' : constrainImageSizeValue(String(payload.size || ''))
     const normalizedPayload = { ...payload, size }
@@ -940,7 +944,7 @@ class BrowserRuntime implements StudioRuntime {
   }
 
   private async generateWithRetry(job: Record<string, any>, payload: Record<string, any>, index: number) {
-    const retries = 2
+    const retries = 0
     let lastError: any
     for (let attempt = 1; attempt <= retries + 1; attempt += 1) {
       try {
@@ -960,9 +964,11 @@ class BrowserRuntime implements StudioRuntime {
   private async generateOne(job: Record<string, any>, payload: Record<string, any>) {
     const { connection, apiKey } = await this.resolveConnection(job.connection_id)
     const controller = new AbortController()
-    const timeoutSeconds = String(job.model).toLocaleLowerCase().includes('4k') ? 420 : 360
+    const timeoutSeconds = 600
     const timeout = window.setTimeout(() => controller.abort(), timeoutSeconds * 1000)
-    const protocol = String(payload.protocol || (job.model.startsWith('gemini-') ? 'gemini' : 'openai'))
+    const expectedProtocol = GEMINI_MODELS.has(job.model) ? 'gemini' : 'openai'
+    const protocol = String(payload.protocol || expectedProtocol)
+    if (protocol !== expectedProtocol) throw new Error(`${job.model} 必须使用 ${expectedProtocol} 协议`)
     try {
       if (protocol === 'gemini') {
         const parts: Array<Record<string, any>> = [{ text: job.prompt }]

@@ -1297,7 +1297,7 @@ class Jobs:
         if not 1 <= count <= 100 or not 1 <= concurrency <= count:
             raise ValueError("count must be 1-100 and concurrency must be between 1 and count")
         model = clean(payload.get("model") or "gpt-image-2")
-        if model in {"gpt-image-2-codex", "gpt-image-2-vip"} and concurrency != 1:
+        if model == "gpt-image-2-vip" and concurrency != 1:
             raise ValueError(f"{model} only supports concurrency 1")
 
         continue_job_id = clean(payload.get("continue_job_id"))

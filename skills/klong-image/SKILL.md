@@ -31,6 +31,7 @@ In browser mode, each visitor configures their own connection. API keys are encr
 
 1. For direct CLI or Codex generation, use the active connection saved by Prompt Studio. Select the read-only `environment` connection in Prompt Studio when `KLONG_API_KEY` should be used. On macOS and Linux, UI-entered keys are process-only, so use the environment connection for direct CLI calls.
 2. If current availability matters, run `--list-models`. Choose `gpt-image-2` by default, or `gemini-3.1-flash-image-preview` when native Gemini is requested.
+   Read [references/models.md](references/models.md) when comparing the seven supported routes, protocols, 4K positioning, or transport safeguards.
 3. Save direct Codex output in the directory resolved by `connection_store.resolve_output_directory()`, which honors `KLONG_OUTPUT_DIR`, Prompt Studio's saved location, then `<current-workspace>/outputs/prompt-studio`. Use a descriptive filename inside that directory. `generate.py` automatically records the task under `.klong/jobs`; do not create or edit manifests manually. Only write elsewhere when the user explicitly requests another location, and note that outputs outside the shared gallery are not added to web history.
 4. For image-to-image work, identify the source PNG, JPEG, or WebP file and pass it with `--input-image`.
 5. Run:
@@ -71,11 +72,11 @@ Generate ten images with at most two requests in flight:
 python <skill-dir>/scripts/generate.py --model gpt-image-2 --prompt "<prompt>" --output outputs/prompt-studio/image.png --count 10 --concurrency 2
 ```
 
-For multiple images, the script writes `image-001.png`, `image-002.png`, and so on. `--count` accepts 1-100 and `--concurrency` accepts any positive integer; effective concurrency never exceeds `--count`. Keep concurrency at 1 unless the user requests batching. The script rejects concurrency above 1 for `gpt-image-2-codex` and `gpt-image-2-vip` because the operator marks those routes as unsuitable for high concurrency.
+For multiple images, the script writes `image-001.png`, `image-002.png`, and so on. `--count` accepts 1-100 and `--concurrency` accepts any positive integer; effective concurrency never exceeds `--count`. Keep concurrency at 1 unless the user requests batching. The script rejects concurrency above 1 for `gpt-image-2-vip` because the operator marks that route as unsuitable for high concurrency.
 
-Transient `429`, `5xx`, network, and timeout failures are retried twice by default with exponential backoff. Customize this with `--retries 0-5` and `--retry-delay 0-60`. Warn the user that retrying a timeout can create a duplicate billable generation if the upstream completed the request but its response was lost.
+Automatic retries default to 0. A broken connection may represent a completed billable request, so inspect history and outputs before explicitly retrying with `--retries 1-5`.
 
-The default timeout is 360 seconds, or 420 seconds when the model ID contains `4k`. Use `--timeout` to override it.
+The default request timeout is 600 seconds, matching the Infinite Canvas stability patch. Use `--timeout` to override it when needed.
 
 ## Models
 
@@ -83,14 +84,15 @@ The default timeout is 360 seconds, or 420 seconds when the model ID contains `4
 | --- | --- | --- |
 | `gpt-image-2` | OpenAI | General generation; operator advertises high concurrency. |
 | `gpt-image-2-c` | OpenAI | Operator advertises enterprise routing and native 4K. |
-| `gpt-image-2-codex` | OpenAI | Alternate Codex route; operator warns against high concurrency. |
 | `gpt-image-2-vip` | OpenAI | Operator advertises native 4K and no high concurrency. |
 | `gemini-3-pro-image-preview` | Gemini | Native Gemini protocol only. |
+| `gemini-3-pro-image-preview-c` | Gemini | Enterprise `-c` route; native Gemini protocol only; operator describes it as stable, concurrent, and native 4K. |
 | `gemini-3.1-flash-image-preview` | Gemini | Native Gemini protocol only; default Gemini choice. |
+| `gemini-3.1-flash-image-preview-c` | Gemini | Enterprise `-c` route; native Gemini protocol only; operator describes it as stable, concurrent, and native 4K. |
 
 Do not infer undocumented quality, resolution, or concurrency guarantees from model names. Treat the operator's pricing-page descriptions as mutable service claims.
 
-The table is a set of known models, not a permanent allowlist. The service can add or remove models. For a new Gemini model, pass `--protocol gemini`; other unknown model IDs default to the OpenAI-compatible protocol.
+The table is the Skill allowlist. Unknown IDs and `gpt-image-2-codex` are rejected. Gemini models always use native Gemini; the three GPT models always use OpenAI Images.
 
 ## Useful Commands
 
