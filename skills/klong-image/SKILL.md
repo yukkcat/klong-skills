@@ -31,7 +31,7 @@ In browser mode, each visitor configures their own connection. API keys are encr
 
 1. For direct CLI or Codex generation, use the active connection saved by Prompt Studio. Select the read-only `environment` connection in Prompt Studio when `KLONG_API_KEY` should be used. On macOS and Linux, UI-entered keys are process-only, so use the environment connection for direct CLI calls.
 2. If current availability matters, run `--list-models`. Choose `gpt-image-2` by default, or `gemini-3.1-flash-image-preview` when native Gemini is requested.
-   Read [references/models.md](references/models.md) when comparing the seven supported routes, protocols, 4K positioning, or transport safeguards.
+   Read [references/models.md](references/models.md) when comparing the nine supported routes, protocols, 4K positioning, or transport safeguards.
 3. Save direct Codex output in the directory resolved by `connection_store.resolve_output_directory()`, which honors `KLONG_OUTPUT_DIR`, Prompt Studio's saved location, then `<current-workspace>/outputs/prompt-studio`. Use a descriptive filename inside that directory. `generate.py` automatically records the task under `.klong/jobs`; do not create or edit manifests manually. Only write elsewhere when the user explicitly requests another location, and note that outputs outside the shared gallery are not added to web history.
 4. For image-to-image work, identify the source PNG, JPEG, or WebP file and pass it with `--input-image`.
 5. Run:
@@ -82,7 +82,9 @@ The default request timeout is 600 seconds, matching the Infinite Canvas stabili
 
 | Model | Protocol | Notes |
 | --- | --- | --- |
-| `gpt-image-2` | OpenAI | General generation; operator advertises high concurrency. |
+| `gpt-image-2` | OpenAI | Default model; documented as 1K. |
+| `gpt-image-2-exact` | OpenAI | Strict pixel-size route; edges 64-4096, total pixels up to 4096x4096. |
+| `gpt-image-2-high` | OpenAI | 1K/2K/4K; accepts `--quality medium|high`. |
 | `gpt-image-2-c` | OpenAI | Operator advertises enterprise routing and native 4K. |
 | `gpt-image-2-vip` | OpenAI | Operator advertises native 4K and no high concurrency. |
 | `gemini-3-pro-image-preview` | Gemini | Native Gemini protocol only. |
@@ -92,7 +94,7 @@ The default request timeout is 600 seconds, matching the Infinite Canvas stabili
 
 Do not infer undocumented quality, resolution, or concurrency guarantees from model names. Treat the operator's pricing-page descriptions as mutable service claims.
 
-The table is the Skill allowlist. Unknown IDs and `gpt-image-2-codex` are rejected. Gemini models always use native Gemini; the three GPT models always use OpenAI Images.
+The table is the Skill allowlist. Unknown IDs and `gpt-image-2-codex` are rejected. Gemini models always use native Gemini; the five GPT models always use OpenAI Images.
 
 ## Useful Commands
 
@@ -130,7 +132,7 @@ For example, `2:3` is `1024x1536` at 1K and `2048x3072` at 2K; its 4K target is 
 
 For automatic sizing, omit `--size`. Availability still depends on the selected model and upstream service. The script detects the returned image bytes and uses the matching `.png`, `.jpg`, `.webp`, or `.gif` suffix; the requested output suffix is not treated as a conversion instruction.
 
-For Gemini models, omit `--size`; the script sends the native `generateContent` request and extracts `inlineData`. This applies to both text-to-image and image-to-image requests.
+For Gemini models, use `--aspect-ratio` and `--image-size 1K|2K|4K`; do not pass `--size`. The script sends native `generationConfig.imageConfig`. Ordinary Gemini also sends matching `responseFormat.image`; enterprise `-c` models omit that compatibility field. It extracts both `inlineData` and `inline_data`.
 
 ## Failures
 

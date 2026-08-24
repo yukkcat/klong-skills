@@ -489,7 +489,6 @@
                       <button
                         type="button"
                         class="parameter-picker-trigger"
-                        :disabled="isGemini"
                         aria-label="选择生成尺寸"
                         @click="openSizePicker"
                       >
@@ -503,6 +502,9 @@
                     <FormField label="并发"><Input v-model="form.concurrency" type="number" min="1" size="md" block :disabled="serialModel" /></FormField>
                     <FormField label="输出格式"><Input model-value="自动 · PNG/JPG/WebP" size="md" block disabled /></FormField>
                   </div>
+                  <FormField v-if="isHighQualityModel" label="质量">
+                    <FilterSelect v-model="form.quality" :options="qualityOptions" size="md" placement="up" selected-indicator="check" />
+                  </FormField>
                   <details class="advanced-settings">
                     <summary><span><Icon icon="lucide:sliders-horizontal" />高级设置</span><Icon icon="lucide:chevron-down" /></summary>
                     <div><FormField label="文件名"><Input v-model="form.filename" size="md" block /></FormField></div>
@@ -1653,7 +1655,7 @@ const elapsed = ref(0)
 const toasts = ref<ToastItem[]>([])
 const confirmation = ref<ConfirmationState | null>(null)
 const deletingHistoryIds = reactive(new Set<string>())
-const form = reactive<any>({ prompt: '', connection_id: '', model: '', size: '', filename: 'generated', count: 1, concurrency: 1 })
+const form = reactive<any>({ prompt: '', connection_id: '', model: '', size: '', quality: 'medium', filename: 'generated', count: 1, concurrency: 1 })
 const settingsStatus = reactive<any>({
   active_connection_id: '',
   active_connection: null,
@@ -1823,6 +1825,11 @@ const filteredModelPickerModels = computed(() => {
 })
 const serialModel = computed(() => ['gpt-image-2-vip'].includes(form.model))
 const isGemini = computed(() => String(form.model).startsWith('gemini-'))
+const isHighQualityModel = computed(() => form.model === 'gpt-image-2-high')
+const qualityOptions: SelectOption[] = [
+  { label: 'Medium', value: 'medium' },
+  { label: 'High', value: 'high' },
+]
 const selectedSizeLabel = computed(() => imageSizeLabel(form.size || 'auto'))
 const sizePickerSelection = computed(() => (
   IMAGE_SIZE_PRESETS.find((preset) => (
@@ -2790,9 +2797,10 @@ async function createJob() {
     const count = Math.max(1, Number(form.count) || 1)
     const concurrency = Math.max(1, Number(form.concurrency) || 1)
     if (concurrency > count) throw new Error('并发数不能超过生成数量')
-    form.size = constrainImageSizeValue(form.size)
+    if (form.model !== 'gpt-image-2-exact') form.size = constrainImageSizeValue(form.size)
     const payload = {
       ...form,
+      quality: isHighQualityModel.value ? form.quality : '',
       connection_id: generationConnection.value.id,
       continue_job_id: job.value?.id || '',
       count,

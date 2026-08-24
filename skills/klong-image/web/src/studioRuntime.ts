@@ -1,6 +1,6 @@
 import { openDB, type IDBPDatabase } from 'idb'
 import JSZip from 'jszip'
-import { constrainImageSizeValue } from './imageSizes'
+import { constrainImageSizeValue, imageSizePreset } from './imageSizes'
 
 export type RuntimeMode = 'local' | 'browser'
 
@@ -58,7 +58,7 @@ const DEFAULT_BASE_URL = 'https://api.klong.lat'
 const DEFAULT_MODEL = 'gpt-image-2'
 const SERIAL_MODELS = new Set(['gpt-image-2-vip'])
 const GEMINI_MODELS = new Set(['gemini-3-pro-image-preview', 'gemini-3-pro-image-preview-c', 'gemini-3.1-flash-image-preview', 'gemini-3.1-flash-image-preview-c'])
-const SUPPORTED_MODELS = new Set(['gpt-image-2', 'gpt-image-2-c', 'gpt-image-2-vip', ...GEMINI_MODELS])
+const SUPPORTED_MODELS = new Set(['gpt-image-2', 'gpt-image-2-exact', 'gpt-image-2-high', 'gpt-image-2-c', 'gpt-image-2-vip', ...GEMINI_MODELS])
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
@@ -774,8 +774,11 @@ class BrowserRuntime implements StudioRuntime {
     }
     const model = String(payload.model || DEFAULT_MODEL).trim()
     if (!SUPPORTED_MODELS.has(model)) throw new Error(`${model} 不是此 Skill 支持的模型`)
+    if (payload.quality && model !== 'gpt-image-2-high') throw new Error('只有 gpt-image-2-high 可设置 quality')
     if (SERIAL_MODELS.has(model) && concurrency !== 1) throw new Error(`${model} 仅支持并发数 1`)
-    const size = model.startsWith('gemini-') ? '' : constrainImageSizeValue(String(payload.size || ''))
+    const size = model === 'gpt-image-2-exact' || model.startsWith('gemini-')
+      ? String(payload.size || '')
+      : constrainImageSizeValue(String(payload.size || ''))
     const normalizedPayload = { ...payload, size }
     const { connection } = await this.resolveConnection(payload.connection_id)
     const continueJobId = String(payload.continue_job_id || '').trim()
@@ -976,10 +979,19 @@ class BrowserRuntime implements StudioRuntime {
           const [header, data] = String(payload.input_image).split(',', 2)
           parts.push({ inlineData: { mimeType: header.match(/^data:([^;]+)/)?.[1] || 'image/png', data } })
         }
+        const preset = imageSizePreset(String(job.size || ''))
+        const imageConfig: Record<string, string> = {}
+        if (preset.ratio !== 'auto') imageConfig.aspectRatio = preset.ratio
+        if (preset.resolution !== 'auto') imageConfig.imageSize = preset.resolution
+        const generationConfig: Record<string, any> = { responseModalities: ['IMAGE'] }
+        if (Object.keys(imageConfig).length) generationConfig.imageConfig = imageConfig
+        if (!job.model.endsWith('-c') && Object.keys(imageConfig).length) {
+          generationConfig.responseFormat = { image: { ...imageConfig } }
+        }
         const response = await fetch(`${connection.base_url}/v1beta/models/${encodeURIComponent(job.model)}:generateContent`, {
           method: 'POST',
           headers: { 'x-goog-api-key': apiKey, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig: { responseModalities: ['TEXT', 'IMAGE'] } }),
+          body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig }),
           credentials: 'omit',
           signal: controller.signal,
         })
@@ -999,6 +1011,7 @@ class BrowserRuntime implements StudioRuntime {
         body.set('prompt', job.prompt)
         body.set('n', '1')
         if (job.size) body.set('size', job.size)
+        if (payload.quality) body.set('quality', String(payload.quality))
         body.set('image', image, `reference.${image.type.includes('webp') ? 'webp' : image.type.includes('png') ? 'png' : 'jpg'}`)
         response = await fetch(`${connection.base_url}/v1/images/edits`, {
           method: 'POST', headers: { Authorization: `Bearer ${apiKey}` }, body, credentials: 'omit', signal: controller.signal,
@@ -1007,7 +1020,7 @@ class BrowserRuntime implements StudioRuntime {
         response = await fetch(`${connection.base_url}/v1/images/generations`, {
           method: 'POST',
           headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: job.model, prompt: job.prompt, n: 1, ...(job.size ? { size: job.size } : {}) }),
+          body: JSON.stringify({ model: job.model, prompt: job.prompt, n: 1, ...(job.size ? { size: job.size } : {}), ...(payload.quality ? { quality: payload.quality } : {}) }),
           credentials: 'omit',
           signal: controller.signal,
         })

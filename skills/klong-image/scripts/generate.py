@@ -28,6 +28,8 @@ from image_sizes import constrain_image_size
 
 OPENAI_MODELS = {
     "gpt-image-2",
+    "gpt-image-2-exact",
+    "gpt-image-2-high",
     "gpt-image-2-c",
     "gpt-image-2-vip",
 }
@@ -37,6 +39,11 @@ GEMINI_MODELS = {
     "gemini-3.1-flash-image-preview",
     "gemini-3.1-flash-image-preview-c",
 }
+GEMINI_ENTERPRISE_MODELS = {
+    "gemini-3-pro-image-preview-c",
+    "gemini-3.1-flash-image-preview-c",
+}
+GEMINI_RATIOS = {"1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9", "21:9", "8:1", "4:1", "1:4", "1:8"}
 DEFAULT_OPENAI_MODEL = "gpt-image-2"
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_INPUT_BYTES = 20 * 1024 * 1024
@@ -334,6 +341,8 @@ def generate_openai(base_url: str, api_key: str, args: argparse.Namespace) -> tu
         fields = {"model": args.model, "prompt": args.prompt, "n": "1"}
         if args.size:
             fields["size"] = args.size
+        if args.quality:
+            fields["quality"] = args.quality
         body, boundary = multipart_body(
             fields, args.input_image_path.name, args.input_image_bytes, args.input_image_mime
         )
@@ -342,6 +351,8 @@ def generate_openai(base_url: str, api_key: str, args: argparse.Namespace) -> tu
         payload = {"model": args.model, "prompt": args.prompt, "n": 1}
         if args.size:
             payload["size"] = args.size
+        if args.quality:
+            payload["quality"] = args.quality
         result = request_json(
             f"{base_url}/v1/images/generations",
             {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -381,9 +392,19 @@ def generate_gemini(base_url: str, api_key: str, args: argparse.Namespace) -> tu
                 "data": base64.b64encode(args.input_image_bytes).decode("ascii"),
             }
         })
+    generation_config = {"responseModalities": ["IMAGE"]}
+    image_config = {}
+    if args.aspect_ratio:
+        image_config["aspectRatio"] = args.aspect_ratio
+    if args.image_size:
+        image_config["imageSize"] = args.image_size
+    if image_config:
+        generation_config["imageConfig"] = image_config
+    if args.model not in GEMINI_ENTERPRISE_MODELS and image_config:
+        generation_config["responseFormat"] = {"image": dict(image_config)}
     payload = {
         "contents": [{"role": "user", "parts": request_parts}],
-        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+        "generationConfig": generation_config,
     }
     result = request_json(
         f"{base_url}/v1beta/models/{args.model}:generateContent",
@@ -421,6 +442,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--connection-name", default="", help=argparse.SUPPRESS)
     parser.add_argument("--input-image", help="PNG, JPEG, or WebP source image for image-to-image editing.")
     parser.add_argument("--size", help="OpenAI-compatible size, for example 1024x1024.")
+    parser.add_argument("--quality", choices=("medium", "high"), help="gpt-image-2-high quality; VIP is fixed to medium.")
+    parser.add_argument("--aspect-ratio", choices=sorted(GEMINI_RATIOS), help="Gemini native aspect ratio.")
+    parser.add_argument("--image-size", choices=("1K", "2K", "4K"), help="Gemini native resolution tier.")
     parser.add_argument("--base-url", help="Override the API base URL from the active connection.")
     parser.add_argument("--timeout", type=int, help="Request timeout in seconds. Defaults to 600.")
     parser.add_argument("--count", type=int, default=1, help="Number of images to generate (1-100).")
@@ -488,10 +512,26 @@ def configure_runtime(args: argparse.Namespace, connection: dict[str, str]) -> N
     if args.model in SERIAL_MODELS and args.concurrency != 1:
         raise ValueError(f"{args.model} only supports --concurrency 1")
     if args.protocol == "gemini" and args.size:
-        raise ValueError("--size is only supported for OpenAI-compatible models")
+        raise ValueError("--size is only supported for OpenAI-compatible models; use --aspect-ratio and --image-size for Gemini")
+    if args.protocol != "gemini" and (args.aspect_ratio or args.image_size):
+        raise ValueError("--aspect-ratio and --image-size are only supported for Gemini models")
+    if args.quality and args.model != "gpt-image-2-high":
+        raise ValueError("--quality is only configurable for gpt-image-2-high")
     args.requested_size = args.size or ""
     if args.size:
-        args.size, args.size_limited = constrain_image_size(args.size)
+        if args.model == "gpt-image-2-exact":
+            match = re.fullmatch(r"(\d+)\s*[xX×]\s*(\d+)", args.size)
+            if not match:
+                raise ValueError("--size must use WIDTHxHEIGHT for gpt-image-2-exact")
+            width, height = map(int, match.groups())
+            if not (64 <= width <= 4096 and 64 <= height <= 4096):
+                raise ValueError("gpt-image-2-exact width and height must each be 64-4096")
+            if width * height > 4096 * 4096:
+                raise ValueError("gpt-image-2-exact total pixels must not exceed 4096x4096")
+            args.size = f"{width}x{height}"
+            args.size_limited = False
+        else:
+            args.size, args.size_limited = constrain_image_size(args.size)
     else:
         args.size_limited = False
 

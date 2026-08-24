@@ -48,6 +48,16 @@ from connection_store import (
 from generation_manifest import record_generation_manifest
 from image_sizes import constrain_image_size
 
+GEMINI_BASE_SIZES = {
+    "1:1": (1024, 1024), "2:3": (1024, 1536), "3:2": (1536, 1024),
+    "3:4": (1024, 1365), "4:3": (1365, 1024), "9:16": (1080, 1920), "16:9": (1920, 1080),
+}
+GEMINI_SIZE_PRESETS = {}
+for _ratio, (_width, _height) in GEMINI_BASE_SIZES.items():
+    for _tier, _multiplier in (("1K", 1), ("2K", 2), ("4K", 4)):
+        _value, _ = constrain_image_size(f"{_width * _multiplier}x{_height * _multiplier}")
+        GEMINI_SIZE_PRESETS[_value] = (_ratio, _tier)
+
 
 MAX_SOURCE_BYTES = 4 * 1024 * 1024
 MAX_BODY_BYTES = 30 * 1024 * 1024
@@ -1318,10 +1328,8 @@ class Jobs:
         mode = "image-to-image" if payload.get("input_image") else "text-to-image"
         size = clean(payload.get("size"))
         requested_protocol = clean(payload.get("protocol"))
-        if size and requested_protocol != "gemini" and not model.startswith("gemini-"):
+        if size and model != "gpt-image-2-exact" and requested_protocol != "gemini" and not model.startswith("gemini-"):
             size, _ = constrain_image_size(size)
-        else:
-            size = ""
         payload = {**payload, "size": size}
         batch = {
             "id": batch_id,
@@ -1398,10 +1406,17 @@ class Jobs:
             "--no-history",
         ]
         protocol, size = clean(payload.get("protocol")), clean(payload.get("size"))
+        quality = clean(payload.get("quality"))
         if protocol in {"openai", "gemini"}:
             command += ["--protocol", protocol]
-        if size and protocol != "gemini" and not job["model"].startswith("gemini-"):
+        if size and (protocol == "gemini" or job["model"].startswith("gemini-")):
+            preset = GEMINI_SIZE_PRESETS.get(size)
+            if preset:
+                command += ["--aspect-ratio", preset[0], "--image-size", preset[1]]
+        elif size:
             command += ["--size", size]
+        if quality:
+            command += ["--quality", quality]
 
         def finish(batch_result: dict[str, Any], status: str, error: str = "") -> None:
             completed_at = now_iso()
