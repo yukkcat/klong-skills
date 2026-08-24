@@ -12,7 +12,7 @@
 - 通过 `/v1/models` 查询当前 Key 可用的模型
 - 单次生成 1-100 张图片
 - 并发数由用户按任务和账户能力设置
-- 对 `429`、`5xx`、网络错误和超时进行指数退避重试
+- 默认不自动重试付费请求；需要时可显式开启指数退避重试
 - 实时显示请求、等待、重试、成功和失败状态
 - 输出包含耗时、实际分辨率和文件大小的 JSON 汇总
 - 校验响应大小和图片格式，拒绝异常内容
@@ -142,14 +142,21 @@ export KLONG_API_KEY="sk-替换成你的密钥"
 
 | 模型 | 协议 | 并发建议 |
 | --- | --- | --- |
-| `gpt-image-2` | OpenAI Images | 通用默认，可按需并发 |
+| `gpt-image-2` | OpenAI Images | 默认模型，仅支持 1K，可按需并发 |
+| `gpt-image-2-exact` | OpenAI Images | 精确像素尺寸，最高 4K，可按需并发 |
+| `gpt-image-2-high` | OpenAI Images | 支持 1K / 2K / 4K，可选 `medium` / `high` 质量 |
 | `gpt-image-2-c` | OpenAI Images | 可按需并发 |
-| `gpt-image-2-codex` | OpenAI Images | 固定并发 1 |
 | `gpt-image-2-vip` | OpenAI Images | 固定并发 1 |
 | `gemini-3-pro-image-preview` | Gemini `generateContent` | 从低并发开始 |
+| `gemini-3-pro-image-preview-c` | Gemini `generateContent` | 企业级原生路由，支持 4K 与并发 |
 | `gemini-3.1-flash-image-preview` | Gemini `generateContent` | Gemini 默认选择 |
+| `gemini-3.1-flash-image-preview-c` | Gemini `generateContent` | 企业级原生路由，支持 4K 与并发 |
 
-模型表是已知模型说明，不是固定白名单。服务新增模型后可直接通过 `--model` 使用。以 `gemini-` 开头的新模型会自动采用 Gemini 协议，也可以通过 `--protocol` 显式指定。
+上表是当前 Skill 的 9 模型白名单。未知模型和 `gpt-image-2-codex` 会被拒绝。五个 GPT 模型固定使用 OpenAI Images 协议，四个 Gemini 模型固定使用 Gemini 原生协议。
+
+`gpt-image-2-exact` 会严格按 `--size WIDTHxHEIGHT` 输出；宽高必须分别在 64-4096 之间，总像素不超过 `4096x4096`。`gpt-image-2-high` 可用 `--quality medium` 或 `--quality high`，其他模型不接受可配置的 `quality`。
+
+Gemini 使用 `--aspect-ratio` 与 `--image-size 1K|2K|4K`。普通 Gemini 会把尺寸同时写入 `generationConfig.imageConfig` 和兼容字段 `responseFormat.image`；企业级 `-c` 模型只发送原生 `imageConfig`。自动比例应省略 `--aspect-ratio`，不要传 `auto`。
 
 查看当前 Key 可用的全部模型：
 
@@ -191,10 +198,14 @@ python .\skills\klong-image\scripts\generate.py `
 | `--name` | 输出文件名 | 网页历史中显示的任务名称 |
 | `--gallery-dir` | 共享输出目录 | 写入网页任务历史和图库元数据的根目录 |
 | `--input-image` | 无 | 图生图源文件，支持 PNG、JPEG、WebP，最大 20 MiB |
+| `--size` | 自动 | GPT 像素尺寸，如 `1024x1024`；`gpt-image-2-exact` 会严格输出该尺寸 |
+| `--quality` | 无 | 仅 `gpt-image-2-high` 支持：`medium` 或 `high` |
+| `--aspect-ratio` | 自动 | Gemini 原生比例，如 `1:1`、`3:4`、`16:9`；自动比例时省略 |
+| `--image-size` | 自动 | Gemini 原生分辨率：`1K`、`2K` 或 `4K`，K 必须大写 |
 | `--count` | `1` | 生成数量，范围 1-100 |
 | `--concurrency` | `1` | 并发请求数，至少为 1，实际不会超过生成数量 |
-| `--timeout` | 自动 | 普通模型默认 360 秒，名称含 `4k` 的模型默认 420 秒 |
-| `--retries` | `2` | 临时错误重试次数，范围 0-5 |
+| `--timeout` | `600` | 请求超时秒数 |
+| `--retries` | `0` | 临时错误重试次数，范围 0-5；默认关闭以避免重复计费 |
 | `--retry-delay` | `3` | 首次重试等待秒数，范围 0-60 |
 | `--check` | 关闭 | 只检查指定模型是否可用 |
 | `--list-models` | 关闭 | 列出当前 Key 可见的模型 |
@@ -206,9 +217,9 @@ python .\skills\klong-image\scripts\generate.py `
 生成过程中，脚本会在 stderr 实时输出请求开始、重试、完成和失败状态。超过 30 秒的任务会定期显示真实等待时间：
 
 ```text
-[start] model=gpt-image-2-vip protocol=openai mode=text-to-image requests=4 concurrency=2 timeout=360s
+[start] model=gpt-image-2-vip protocol=openai mode=text-to-image requests=4 concurrency=1 timeout=600s
 [request 1/4] started
-[waiting] elapsed=30.0s active=2 completed=0/4 succeeded=0 failed=0
+[waiting] elapsed=30.0s active=1 completed=0/4 succeeded=0 failed=0
 [request 1/4] completed duration=91.2s size=14.40MiB dimensions=3840x2160
 [complete] duration=143.8s requested=4 succeeded=3 failed=1
 ```
@@ -229,7 +240,7 @@ Codex 会把结果整理成便于阅读的表格：
 
 本项目对 `gpt-image-2` 进行过 10 并发验证：10 个请求成功 8 个，2 个因上游 `image_poll_timeout` 失败。该结果仅表示测试时的线路状态，不构成可用性保证。
 
-超时重试可能产生重复计费：上游可能已经完成生成，但客户端没有收到响应。对成本敏感的任务可使用 `--retries 0`，并在重试批次前检查已经生成的编号文件。
+自动重试默认关闭，因为超时或断线时上游可能已经完成并计费，但客户端没有收到响应。确实需要重试时可使用 `--retries 1-5`；重试前先检查任务历史和已生成文件。
 
 ## 常见问题
 
@@ -238,10 +249,10 @@ Codex 会把结果整理成便于阅读的表格：
 | `未找到 API Key` | Windows 可在网页“连接设置”中保存；其他系统的跨进程调用请设置 `KLONG_API_KEY` |
 | 图库没有显示新图片 | 点击图库中的刷新按钮，并确认图片位于当前工作台的输出目录 |
 | `401` / `403` | 检查 Key、余额和模型分组权限 |
-| `429` | 降低并发，等待自动重试或稍后再试 |
+| `429` | 降低并发；确认没有已完成的计费请求后，再决定是否显式重试 |
 | `image_poll_timeout` | 上游生成超时；保留已成功文件，仅补跑失败任务 |
 | 模型检查失败 | 使用 `--list-models` 查看当前 Key 实际可用模型 |
-| Gemini 请求失败 | 确认使用 Gemini 协议，且没有传入 `--size` |
+| Gemini 请求失败 | 确认使用 Gemini 协议；使用 `--aspect-ratio` 和大写 `--image-size 1K|2K|4K`，不要传 `--size` |
 
 ## 项目结构
 
@@ -260,8 +271,9 @@ skills/
 
 - [Codex + CC Switch 图文配置教程](docs/codex-cc-switch.md)
 - [模型与价格](https://api.klong.lat/pricing)
-- [图片接口文档](https://docs.klong.lat/zh/docs/api/ai-model/images/openai/post-v1-images-generations)
-- [Codex CLI 教程](https://docs.klong.lat/zh/docs/apps/codex-cli)
+- [小恐龙 API 官方文档](https://docs.klong.lat/)
+- [GPT Image 2 接口文档](https://docs.klong.lat/docs/image/gpt-image-2)
+- [Nano Banana 接口文档](https://docs.klong.lat/docs/image/nano-banana)
 - [安全问题报告](SECURITY.md)
 
 ## 贡献者
