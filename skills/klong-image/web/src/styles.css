@@ -509,6 +509,7 @@ button, [role="button"], input, select, textarea { -webkit-tap-highlight-color: 
 .source-badge-youmind-gpt-image-2 { background: #dfe8f1; color: #3e617d; }
 .source-badge-youmind-nano-banana-pro { background: #e6ebd7; color: #58672c; }
 .source-badge-davidwu-gpt-image2-prompts { background: #e6e6e4; color: #474a46; }
+.source-badge-freestylefly-gpt-image-2 { background: #eadff0; color: #6b4c79; }
 .source-item {
   min-height: 32px;
   grid-template-columns: 18px minmax(0, 1fr) auto;

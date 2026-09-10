@@ -50,6 +50,21 @@ type PromptLibrary = {
   items: Array<Record<string, any>>
   sources: Array<Record<string, any>>
   synced_at: string
+  registry?: {
+    url?: string
+    revision?: string
+    generated_at?: string
+  }
+}
+
+type PromptRegistrySource = {
+  id: string
+  name: string
+  homepage: string
+  upstreamUrl: string
+  count: number
+  path: string
+  sha256: string
 }
 
 const DB_NAME = 'klong-prompt-studio'
@@ -59,6 +74,23 @@ const DEFAULT_MODEL = 'gpt-image-2'
 const SERIAL_MODELS = new Set(['gpt-image-2-vip'])
 const GEMINI_MODELS = new Set(['gemini-3-pro-image-preview', 'gemini-3-pro-image-preview-c', 'gemini-3.1-flash-image-preview', 'gemini-3.1-flash-image-preview-c'])
 const SUPPORTED_MODELS = new Set(['gpt-image-2', 'gpt-image-2-exact', 'gpt-image-2-high', 'gpt-image-2-c', 'gpt-image-2-vip', ...GEMINI_MODELS])
+const PROMPT_REGISTRY_BASE = 'https://raw.githubusercontent.com/yukkcat/image-prompts/main/dist'
+const PROMPT_REGISTRY_MANIFEST_MAX_BYTES = 128 * 1024
+const PROMPT_REGISTRY_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
+const PROMPT_REGISTRY_TIMEOUT_MS = 30_000
+const PROMPT_REGISTRY_MANIFEST_FIELDS = new Set([
+  'schemaVersion', 'generatedAt', 'registryHash', 'total', 'promptsPath', 'sources',
+])
+const PROMPT_REGISTRY_SOURCE_FIELDS = new Set([
+  'id', 'name', 'homepage', 'upstreamUrl', 'count', 'path', 'sha256',
+])
+const PROMPT_REGISTRY_ITEM_FIELDS = new Set([
+  'id', 'sourceId', 'title', 'prompt', 'description', 'coverUrl', 'referenceImageUrls',
+  'tags', 'author', 'sourceUrl', 'createdAt', 'imageMode', 'imageModel', 'imageSize', 'imageCount',
+])
+const PROMPT_REGISTRY_REQUIRED_ITEM_FIELDS = new Set(
+  [...PROMPT_REGISTRY_ITEM_FIELDS].filter((field) => !['imageSize', 'imageCount'].includes(field)),
+)
 const encoder = new TextEncoder()
 const decoder = new TextDecoder()
 
@@ -68,6 +100,288 @@ function nowIso() {
 
 function randomId() {
   return crypto.randomUUID().replaceAll('-', '')
+}
+
+function plainRecord(value: unknown): value is Record<string, any> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function exactFields(value: Record<string, any>, expected: Set<string>, label: string) {
+  const fields = Object.keys(value)
+  if (fields.length !== expected.size || fields.some((field) => !expected.has(field))) {
+    throw new Error(`${label}字段与 schema v1 不匹配`)
+  }
+}
+
+function registryInline(value: unknown, field: string) {
+  if (typeof value !== 'string') throw new Error(`提示词 registry 的 ${field} 必须是字符串`)
+  return value.trim().replace(/\s+/gu, ' ')
+}
+
+function registryMultiline(value: unknown, field: string) {
+  if (typeof value !== 'string') throw new Error(`提示词 registry 的 ${field} 必须是字符串`)
+  return value
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .map((line) => line.replace(/\s+$/u, ''))
+    .join('\n')
+    .trim()
+}
+
+function registryUrl(value: unknown, field: string, allowEmpty = false) {
+  if (typeof value !== 'string') throw new Error(`提示词 registry 的 ${field} 必须是字符串`)
+  const raw = value.trim()
+  if (!raw && allowEmpty) return ''
+  let parsed: URL
+  try {
+    parsed = new URL(raw)
+  } catch {
+    throw new Error(`提示词 registry 的 ${field} 不是有效 URL`)
+  }
+  if (/\s/u.test(raw) || !['http:', 'https:'].includes(parsed.protocol) || !parsed.hostname) {
+    throw new Error(`提示词 registry 的 ${field} 必须是绝对 HTTP(S) URL`)
+  }
+  return raw
+}
+
+function registryPath(value: unknown) {
+  if (typeof value !== 'string') throw new Error('提示词 registry 路径必须是字符串')
+  const path = value.replaceAll('\\', '/').replace(/^\/+/, '')
+  if (!path || path.split('/').includes('..') || !/^[A-Za-z0-9._/-]+$/.test(path)) {
+    throw new Error('提示词 registry 路径无效')
+  }
+  return path
+}
+
+function registryCreatedAt(value: unknown) {
+  const createdAt = registryInline(value, 'createdAt')
+  if (!createdAt) return ''
+  const date = createdAt.match(/^(\d{4})-(\d{2})-(\d{2})$/)
+  if (date) {
+    const year = Number(date[1])
+    const month = Number(date[2])
+    const day = Number(date[3])
+    const parsed = new Date(Date.UTC(year, month - 1, day))
+    if (parsed.getUTCFullYear() !== year || parsed.getUTCMonth() !== month - 1 || parsed.getUTCDate() !== day) {
+      throw new Error('提示词 registry 的 createdAt 日期无效')
+    }
+    return createdAt
+  }
+  const dateTime = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/
+  if (!dateTime.test(createdAt) || Number.isNaN(Date.parse(createdAt))) {
+    throw new Error('提示词 registry 的 createdAt 必须是日期或 RFC 3339 时间')
+  }
+  return createdAt
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  if (plainRecord(value)) {
+    return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+  }
+  const serialized = JSON.stringify(value)
+  if (serialized === undefined) throw new Error('提示词 registry 包含无法序列化的数据')
+  return serialized
+}
+
+async function sha256Hex(bytes: Uint8Array) {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', Uint8Array.from(bytes).buffer))
+  return [...digest].map((value) => value.toString(16).padStart(2, '0')).join('')
+}
+
+async function fetchRegistryBytes(path: string, maxBytes: number, force: boolean) {
+  const controller = new AbortController()
+  const timer = window.setTimeout(() => controller.abort(), PROMPT_REGISTRY_TIMEOUT_MS)
+  try {
+    const response = await fetch(`${PROMPT_REGISTRY_BASE}/${registryPath(path)}`, {
+      cache: force ? 'reload' : 'default',
+      credentials: 'omit',
+      headers: { Accept: 'application/json' },
+      signal: controller.signal,
+    })
+    if (!response.ok) throw new Error(`提示词 registry 下载失败：HTTP ${response.status}`)
+    const declaredLength = response.headers.get('Content-Length')
+    if (declaredLength) {
+      const length = Number(declaredLength)
+      if (!Number.isSafeInteger(length) || length < 0) throw new Error('提示词 registry 返回了无效长度')
+      if (length > maxBytes) throw new Error(`提示词 registry 响应超过 ${maxBytes} 字节`)
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer())
+    if (bytes.byteLength > maxBytes) throw new Error(`提示词 registry 响应超过 ${maxBytes} 字节`)
+    return bytes
+  } catch (error: any) {
+    if (error?.name === 'AbortError') throw new Error('提示词 registry 下载超时')
+    throw error
+  } finally {
+    window.clearTimeout(timer)
+  }
+}
+
+function parseRegistryJson(bytes: Uint8Array, label: string) {
+  try {
+    return JSON.parse(decoder.decode(bytes).replace(/^\uFEFF/u, ''))
+  } catch {
+    throw new Error(`提示词 registry 的 ${label} 不是有效 JSON`)
+  }
+}
+
+function normalizeRegistrySource(value: unknown): PromptRegistrySource {
+  if (!plainRecord(value)) throw new Error('提示词 registry 的来源必须是对象')
+  exactFields(value, PROMPT_REGISTRY_SOURCE_FIELDS, '提示词 registry 来源')
+  const id = registryInline(value.id, 'source.id')
+  const name = registryInline(value.name, 'source.name')
+  const homepage = registryUrl(value.homepage, 'source.homepage')
+  const upstreamUrl = registryUrl(value.upstreamUrl, 'source.upstreamUrl')
+  const path = registryPath(value.path)
+  const sha256 = registryInline(value.sha256, 'source.sha256').toLowerCase()
+  if (!/^[a-z0-9-]+$/.test(id) || !name) throw new Error(`提示词 registry 来源无效：${id.slice(0, 80)}`)
+  if (!Number.isInteger(value.count) || value.count < 0 || !/^[a-f0-9]{64}$/.test(sha256)) {
+    throw new Error(`提示词 registry 来源元数据无效：${id}`)
+  }
+  return { id, name: name.slice(0, 160), homepage, upstreamUrl, count: value.count, path, sha256 }
+}
+
+function normalizeRegistryItem(
+  value: unknown,
+  source: PromptRegistrySource,
+  sortOrder: number,
+) {
+  if (!plainRecord(value)) throw new Error('提示词 registry 的记录必须是对象')
+  const fields = Object.keys(value)
+  const unknown = fields.filter((field) => !PROMPT_REGISTRY_ITEM_FIELDS.has(field))
+  const missing = [...PROMPT_REGISTRY_REQUIRED_ITEM_FIELDS].filter((field) => !(field in value))
+  if (unknown.length) throw new Error(`提示词 registry 记录包含未知字段：${unknown.sort().join(', ')}`)
+  if (missing.length) throw new Error(`提示词 registry 记录缺少字段：${missing.sort().join(', ')}`)
+
+  const sourceId = registryInline(value.sourceId, 'sourceId')
+  const id = registryInline(value.id, 'id')
+  if (sourceId !== source.id || !new RegExp(`^${source.id}:[a-f0-9]{16}$`).test(id)) {
+    throw new Error(`提示词 registry 记录的 id/sourceId 无效：${id.slice(0, 120)}`)
+  }
+  const title = registryInline(value.title, 'title')
+  const prompt = registryMultiline(value.prompt, 'prompt')
+  const description = registryMultiline(value.description, 'description')
+  if (!title || !prompt) throw new Error(`提示词 registry 记录缺少标题或提示词：${id}`)
+  const coverUrl = registryUrl(value.coverUrl, 'coverUrl', true)
+  const sourceUrl = registryUrl(value.sourceUrl, 'sourceUrl')
+
+  if (!Array.isArray(value.referenceImageUrls)) throw new Error('提示词 registry 的 referenceImageUrls 必须是数组')
+  const references = value.referenceImageUrls.map((url: unknown) => registryUrl(url, 'referenceImageUrls[]'))
+  if (new Set(references).size !== references.length) throw new Error('提示词 registry 的参考图 URL 必须唯一')
+
+  if (!Array.isArray(value.tags)) throw new Error('提示词 registry 的 tags 必须是数组')
+  const tags = value.tags.map((tag: unknown) => registryInline(tag, 'tags[]'))
+  if (tags.some((tag: string) => !tag) || new Set(tags).size !== tags.length) {
+    throw new Error('提示词 registry 的 tags 必须是非空且唯一的字符串')
+  }
+
+  const imageMode = registryInline(value.imageMode, 'imageMode')
+  if (!['', 'generate', 'edit'].includes(imageMode)) throw new Error(`提示词 registry 的 imageMode 无效：${id}`)
+  const imageModel = registryInline(value.imageModel, 'imageModel')
+  const result: Record<string, any> = {
+    id,
+    title: title.slice(0, 160),
+    description: description.slice(0, 500),
+    prompt,
+    category: (tags[0] || '').slice(0, 80),
+    sub_category: (tags[1] || '').slice(0, 80),
+    preview: coverUrl.slice(0, 1200),
+    author: registryInline(value.author, 'author').slice(0, 120),
+    source_id: source.id,
+    source_name: source.name,
+    source_homepage: source.homepage,
+    source_url: sourceUrl.slice(0, 1200),
+    reference_image_urls: references.slice(0, 12),
+    tags: tags.slice(0, 24),
+    image_mode: imageMode,
+    image_model: imageModel.slice(0, 80),
+    created_at: registryCreatedAt(value.createdAt),
+    sort_order: sortOrder,
+  }
+  if ('imageSize' in value) {
+    const imageSize = registryInline(value.imageSize, 'imageSize')
+    if (!imageSize) throw new Error(`提示词 registry 的 imageSize 不能为空：${id}`)
+    result.image_size = imageSize.slice(0, 40)
+  }
+  if ('imageCount' in value) {
+    if (!Number.isInteger(value.imageCount) || value.imageCount < 1) {
+      throw new Error(`提示词 registry 的 imageCount 无效：${id}`)
+    }
+    result.image_count = value.imageCount
+  }
+  return result
+}
+
+async function fetchPromptRegistry(force = false): Promise<PromptLibrary> {
+  const started = performance.now()
+  const manifestBytes = await fetchRegistryBytes('manifest.json', PROMPT_REGISTRY_MANIFEST_MAX_BYTES, force)
+  const manifest = parseRegistryJson(manifestBytes, 'manifest')
+  if (!plainRecord(manifest)) throw new Error('提示词 registry manifest 必须是对象')
+  exactFields(manifest, PROMPT_REGISTRY_MANIFEST_FIELDS, '提示词 registry manifest')
+  if (manifest.schemaVersion !== 1) throw new Error(`不支持的提示词 registry schema：${String(manifest.schemaVersion)}`)
+  const revision = registryInline(manifest.registryHash, 'registryHash').toLowerCase()
+  const generatedAt = registryInline(manifest.generatedAt, 'generatedAt')
+  const promptsPath = registryPath(manifest.promptsPath)
+  if (!/^[a-f0-9]{64}$/.test(revision) || !generatedAt) throw new Error('提示词 registry manifest 缺少有效版本')
+  if (!Array.isArray(manifest.sources) || !manifest.sources.length) throw new Error('提示词 registry manifest 没有来源')
+  const sources = manifest.sources.map(normalizeRegistrySource)
+  if (new Set(sources.map((source) => source.id)).size !== sources.length) {
+    throw new Error('提示词 registry manifest 包含重复来源')
+  }
+  if (!Number.isInteger(manifest.total) || manifest.total < 0
+      || manifest.total !== sources.reduce((total, source) => total + source.count, 0)) {
+    throw new Error('提示词 registry manifest 总数与来源计数不一致')
+  }
+
+  const promptBytes = await fetchRegistryBytes(promptsPath, PROMPT_REGISTRY_PAYLOAD_MAX_BYTES, force)
+  const canonicalSources = encoder.encode(canonicalJson(manifest.sources))
+  const revisionInput = new Uint8Array(canonicalSources.byteLength + promptBytes.byteLength)
+  revisionInput.set(canonicalSources)
+  revisionInput.set(promptBytes, canonicalSources.byteLength)
+  if (await sha256Hex(revisionInput) !== revision) throw new Error('提示词 registry manifest 与提示词快照哈希不一致')
+
+  const rawItems = parseRegistryJson(promptBytes, '提示词快照')
+  if (!Array.isArray(rawItems) || rawItems.length !== manifest.total) {
+    throw new Error('提示词 registry 快照数量与 manifest 不一致')
+  }
+  const sourceById = new Map(sources.map((source) => [source.id, source]))
+  const sourceCounts = new Map(sources.map((source) => [source.id, 0]))
+  const seenIds = new Set<string>()
+  const items = rawItems.map((rawItem) => {
+    const sourceId = plainRecord(rawItem) && typeof rawItem.sourceId === 'string' ? rawItem.sourceId : ''
+    const source = sourceById.get(sourceId)
+    if (!source) throw new Error(`提示词 registry 记录引用了未知来源：${sourceId.slice(0, 80)}`)
+    const sortOrder = sourceCounts.get(sourceId) || 0
+    const item = normalizeRegistryItem(rawItem, source, sortOrder)
+    if (seenIds.has(item.id)) throw new Error(`提示词 registry 记录 ID 重复：${item.id}`)
+    seenIds.add(item.id)
+    sourceCounts.set(sourceId, sortOrder + 1)
+    return item
+  })
+  for (const source of sources) {
+    if (sourceCounts.get(source.id) !== source.count) throw new Error(`提示词 registry 来源计数不一致：${source.id}`)
+  }
+  const syncedAt = nowIso()
+  const fetchMs = Math.max(0, Math.round(performance.now() - started))
+  return {
+    items,
+    sources: sources.map((source) => ({
+      id: source.id,
+      name: source.name,
+      adapter: 'registry',
+      url: source.upstreamUrl,
+      homepage: source.homepage,
+      registry_path: source.path,
+      count: source.count,
+      sha256: source.sha256,
+      status: 'ready',
+      error: '',
+      synced_at: syncedAt,
+      fetch_ms: fetchMs,
+    })),
+    synced_at: syncedAt,
+    registry: { url: PROMPT_REGISTRY_BASE, revision, generated_at: generatedAt },
+  }
 }
 
 function nonnegativeInteger(value: unknown, fallback = 0) {
@@ -534,8 +848,12 @@ class BrowserRuntime implements StudioRuntime {
   }
 
   private async loadPromptLibrary(force = false) {
-    if (this.promptLibrary && !force) return this.promptLibrary
-    const response = await fetch(new URL('prompt-library.json', document.baseURI), { cache: force ? 'reload' : 'default' })
+    if (force) {
+      this.promptLibrary = await fetchPromptRegistry(true)
+      return this.promptLibrary
+    }
+    if (this.promptLibrary) return this.promptLibrary
+    const response = await fetch(new URL('prompt-library.json', document.baseURI))
     if (!response.ok) throw new Error(`提示词快照加载失败：HTTP ${response.status}`)
     const data = await response.json()
     if (!Array.isArray(data.items) || !Array.isArray(data.sources)) throw new Error('提示词快照格式不正确')
@@ -545,7 +863,14 @@ class BrowserRuntime implements StudioRuntime {
 
   private async librarySnapshot() {
     const library = await this.loadPromptLibrary()
-    return { sources: library.sources, syncing: false, synced_at: library.synced_at, prompt_count: library.items.length }
+    return {
+      sources: library.sources,
+      syncing: false,
+      synced_at: library.synced_at,
+      prompt_count: library.items.length,
+      registry_revision: library.registry?.revision || '',
+      registry_generated_at: library.registry?.generated_at || '',
+    }
   }
 
   private async refreshLibrary() {
@@ -561,10 +886,14 @@ class BrowserRuntime implements StudioRuntime {
     const source = String(params.get('source') || '')
     const category = String(params.get('category') || '')
     const sourceItems = library.items.filter((item) => !source || item.source_id === source)
-    const categories = [...new Set(sourceItems.map((item) => item.category || item.sub_category || '').filter(Boolean))]
+    const categoryLabel = (item: Record<string, any>) => [item.category, item.sub_category]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+      .join(' / ')
+    const categories = [...new Set(sourceItems.map(categoryLabel).filter(Boolean))]
       .sort((left, right) => String(left).localeCompare(String(right), 'zh-CN'))
     const items = sourceItems.filter((item) => {
-      const itemCategory = item.category || item.sub_category || ''
+      const itemCategory = categoryLabel(item)
       if (category && itemCategory !== category) return false
       if (!keyword) return true
       return ['title', 'description', 'prompt', 'category', 'sub_category', 'author', 'source_name']

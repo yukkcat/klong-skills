@@ -1603,6 +1603,7 @@ const sourceDisplay: Record<string, { badge: string; name: string }> = {
   'youmind-gpt-image-2': { badge: 'Y', name: 'YouMind' },
   'youmind-nano-banana-pro': { badge: 'N', name: 'Nano' },
   'davidwu-gpt-image2-prompts': { badge: 'D', name: 'DavidWu' },
+  'freestylefly-gpt-image-2': { badge: 'F', name: 'Freestylefly' },
 }
 
 const library = reactive<any>({ sources: [], syncing: true, prompt_count: 0, synced_at: '' })
@@ -2503,16 +2504,18 @@ function schedulePromptReset(delay = 0) {
 }
 
 async function refreshAll() {
+  if (library.syncing) return
+  library.syncing = true
+  showToast('info', '正在更新提示词库')
   try {
     await api('/api/refresh', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: '{}',
     })
-    library.syncing = true
-    showToast('info', '已开始更新提示词库')
     scheduleLibraryPoll(true, 500)
   } catch (error: any) {
+    library.syncing = false
     showToast('error', error.message)
   }
 }

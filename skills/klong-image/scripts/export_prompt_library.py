@@ -33,6 +33,13 @@ def main() -> int:
         "sources": sources,
         "synced_at": str(payload.get("synced_at") or ""),
     }
+    registry = payload.get("registry")
+    if isinstance(registry, dict):
+        snapshot["registry"] = {
+            "url": str(registry.get("url") or ""),
+            "revision": str(registry.get("revision") or ""),
+            "generated_at": str(registry.get("generated_at") or ""),
+        }
     output = args.output.expanduser()
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")

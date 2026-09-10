@@ -7,7 +7,6 @@ import argparse
 import base64
 import copy
 import hashlib
-import html
 import ipaddress
 import json
 import mimetypes
@@ -22,14 +21,13 @@ import threading
 import time
 import webbrowser
 import zipfile
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from connection_store import (
@@ -59,25 +57,59 @@ for _ratio, (_width, _height) in GEMINI_BASE_SIZES.items():
         GEMINI_SIZE_PRESETS[_value] = (_ratio, _tier)
 
 
-MAX_SOURCE_BYTES = 4 * 1024 * 1024
+REGISTRY_MANIFEST_MAX_BYTES = 128 * 1024
+REGISTRY_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
+REGISTRY_TIMEOUT = 30
 MAX_BODY_BYTES = 30 * 1024 * 1024
 MAX_PREVIEW_BYTES = 12 * 1024 * 1024
 MAX_GALLERY_BATCH = 10_000
 SOURCE_TIMEOUT = 12
-SYNC_WORKERS = 4
 ASSET_DIR = Path(__file__).resolve().parent.parent / "assets" / "prompt-studio"
 GENERATE_SCRIPT = Path(__file__).resolve().parent / "generate.py"
 CACHE_PATH = CACHE_DIR / "prompt-library.json"
 PREVIEW_CACHE_DIR = CACHE_DIR / "previews"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"}
+# The registry is generated and validated by https://github.com/yukkcat/image-prompts.
+# Keep the source metadata here as a fallback for an empty/offline cache; a successful
+# registry sync replaces it with the metadata from manifest.json.
+REGISTRY_BASE_URL = "https://raw.githubusercontent.com/yukkcat/image-prompts/main/dist"
 SOURCES = [
-    {"id": "banana-prompt-quicker", "name": "Banana Prompt Quicker", "adapter": "json", "url": "https://glidea.github.io/banana-prompt-quicker/prompts.json", "homepage": "https://glidea.github.io/banana-prompt-quicker/"},
-    {"id": "awesome-gpt-image", "name": "Awesome GPT Image", "adapter": "markdown", "url": "https://raw.githubusercontent.com/ZeroLu/awesome-gpt-image/main/README.zh-CN.md", "homepage": "https://github.com/ZeroLu/awesome-gpt-image"},
-    {"id": "awesome-gpt4o-image-prompts", "name": "Awesome GPT-4o Image Prompts", "adapter": "html", "url": "https://raw.githubusercontent.com/ImgEdify/Awesome-GPT4o-Image-Prompts/main/Prompts.html", "homepage": "https://github.com/ImgEdify/Awesome-GPT4o-Image-Prompts"},
-    {"id": "youmind-gpt-image-2", "name": "YouMind GPT Image 2", "adapter": "markdown", "url": "https://raw.githubusercontent.com/YouMind-OpenLab/awesome-gpt-image-2/main/README_zh.md", "homepage": "https://github.com/YouMind-OpenLab/awesome-gpt-image-2"},
-    {"id": "youmind-nano-banana-pro", "name": "YouMind Nano Banana Pro", "adapter": "markdown", "url": "https://raw.githubusercontent.com/YouMind-OpenLab/awesome-nano-banana-pro-prompts/main/README_zh.md", "homepage": "https://github.com/YouMind-OpenLab/awesome-nano-banana-pro-prompts"},
-    {"id": "davidwu-gpt-image2-prompts", "name": "DavidWu GPT Image 2 Prompts", "adapter": "json", "url": "https://raw.githubusercontent.com/davidwuw0811-boop/awesome-gpt-image2-prompts/main/prompts.json", "homepage": "https://github.com/davidwuw0811-boop/awesome-gpt-image2-prompts"},
+    {"id": "banana-prompt-quicker", "name": "Banana Prompt Quicker", "adapter": "json", "url": "https://glidea.github.io/banana-prompt-quicker/prompts.json", "homepage": "https://glidea.github.io/banana-prompt-quicker/", "registry_path": "sources/banana-prompt-quicker.json"},
+    {"id": "davidwu-gpt-image2-prompts", "name": "DavidWu GPT Image 2 Prompts", "adapter": "json", "url": "https://raw.githubusercontent.com/davidwuw0811-boop/awesome-gpt-image2-prompts/main/prompts.json", "homepage": "https://github.com/davidwuw0811-boop/awesome-gpt-image2-prompts", "registry_path": "sources/davidwu-gpt-image2-prompts.json"},
+    {"id": "freestylefly-gpt-image-2", "name": "Freestylefly GPT Image 2", "adapter": "json", "url": "https://raw.githubusercontent.com/freestylefly/awesome-gpt-image-2/main/data/cases.json", "homepage": "https://github.com/freestylefly/awesome-gpt-image-2", "registry_path": "sources/freestylefly-gpt-image-2.json"},
+    {"id": "awesome-gpt-image", "name": "Awesome GPT Image", "adapter": "markdown", "url": "https://raw.githubusercontent.com/ZeroLu/awesome-gpt-image/main/README.zh-CN.md", "homepage": "https://github.com/ZeroLu/awesome-gpt-image", "registry_path": "sources/awesome-gpt-image.json"},
+    {"id": "awesome-gpt4o-image-prompts", "name": "Awesome GPT-4o Image Prompts", "adapter": "markdown", "url": "https://raw.githubusercontent.com/ImgEdify/Awesome-GPT4o-Image-Prompts/main/README.zh-CN.md", "homepage": "https://github.com/ImgEdify/Awesome-GPT4o-Image-Prompts", "registry_path": "sources/awesome-gpt4o-image-prompts.json"},
+    {"id": "youmind-gpt-image-2", "name": "YouMind GPT Image 2", "adapter": "markdown", "url": "https://raw.githubusercontent.com/YouMind-OpenLab/awesome-gpt-image-2/main/README_zh.md", "homepage": "https://github.com/YouMind-OpenLab/awesome-gpt-image-2", "registry_path": "sources/youmind-gpt-image-2.json"},
+    {"id": "youmind-nano-banana-pro", "name": "YouMind Nano Banana Pro", "adapter": "markdown", "url": "https://raw.githubusercontent.com/YouMind-OpenLab/awesome-nano-banana-pro-prompts/main/README_zh.md", "homepage": "https://github.com/YouMind-OpenLab/awesome-nano-banana-pro-prompts", "registry_path": "sources/youmind-nano-banana-pro.json"},
 ]
+
+REGISTRY_ITEM_FIELDS = {
+    "id",
+    "sourceId",
+    "title",
+    "prompt",
+    "description",
+    "coverUrl",
+    "referenceImageUrls",
+    "tags",
+    "author",
+    "sourceUrl",
+    "createdAt",
+    "imageMode",
+    "imageModel",
+    "imageSize",
+    "imageCount",
+}
+REGISTRY_REQUIRED_ITEM_FIELDS = REGISTRY_ITEM_FIELDS - {"imageSize", "imageCount"}
+REGISTRY_MANIFEST_FIELDS = {
+    "schemaVersion",
+    "generatedAt",
+    "registryHash",
+    "total",
+    "promptsPath",
+    "sources",
+}
+REGISTRY_SOURCE_FIELDS = {"id", "name", "homepage", "upstreamUrl", "count", "path", "sha256"}
 
 
 def now_iso() -> str:
@@ -341,108 +373,310 @@ def image_mime(payload: bytes, fallback: str = "") -> str:
     return fallback if fallback.startswith("image/") else "application/octet-stream"
 
 
-def strip_markup(value: str) -> str:
-    text = html.unescape(value)
-    text = re.sub(r"!\[[^\]]*]\([^)]+\)", "", text)
-    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.I)
-    text = re.sub(r"<[^>]+>", "", text)
-    text = re.sub(r"\[([^\]]+)]\([^)]+\)", r"\1", text)
-    text = re.sub(r"[`*_~>#]+", "", text)
-    return clean(text)
+def registry_path(value: object) -> str:
+    """Return a safe path relative to the published registry directory."""
+    path = str(value or "").replace("\\", "/").lstrip("/")
+    if not path or ".." in path.split("/") or not re.fullmatch(r"[A-Za-z0-9._/-]+", path):
+        raise ValueError("invalid prompt registry path")
+    return path
 
 
-def image_urls(text: str) -> list[str]:
-    found = re.findall(r"!\[[^\]]*]\(([^)\s]+)", text)
-    found += re.findall(r"<img\b[^>]*\bsrc=[\"']([^\"']+)", text, flags=re.I)
-    urls = list(dict.fromkeys(html.unescape(item).strip() for item in found if item.strip()))
-    return [url for url in urls if not is_decorative_image(url)]
-
-
-def is_decorative_image(value: str) -> bool:
-    parsed = urlparse(value)
-    hostname = (parsed.hostname or "").lower()
-    path = parsed.path.lower()
-    return (
-        hostname in {"img.shields.io", "awesome.re"}
-        or "badge.svg" in path
-        or "/actions/workflows/" in path
-    )
-
-
-def parse_json(payload: bytes) -> list[dict[str, Any]]:
-    data = json.loads(payload.decode("utf-8-sig"))
-    if isinstance(data, dict):
-        data = next((data[key] for key in ("items", "prompts", "data") if isinstance(data.get(key), list)), [])
-    if not isinstance(data, list):
-        return []
-    return [item for item in data if isinstance(item, dict)]
-
-
-def parse_markdown(payload: bytes) -> list[dict[str, Any]]:
-    lines = payload.decode("utf-8-sig", errors="replace").splitlines()
-    sections: list[tuple[str, str, str]] = []
-    category, title, start = "", "", -1
-    for index, line in enumerate(lines):
-        match = re.match(r"^(#{2,3})\s+(.+?)\s*$", line)
-        if not match:
-            continue
-        level, heading = match.groups()
-        if title and start >= 0:
-            sections.append((category, title, "\n".join(lines[start:index])))
-            title, start = "", -1
-        heading = re.sub(r"^(?:No\.)?\s*\d+\s*[:：.、-]*\s*", "", strip_markup(heading), flags=re.I)
-        if level == "##":
-            category = heading
-        else:
-            title, start = heading, index
-    if title and start >= 0:
-        sections.append((category, title, "\n".join(lines[start:])))
-    result = []
-    fence = re.compile(r"```[\w-]*\s*\n(.*?)(?:\n```|$)", re.S)
-    for order, (category, title, section) in enumerate(sections):
-        blocks = [clean_multiline(match) for match in fence.findall(section)]
-        prompt = next((block for block in blocks if len(block) >= 10), "")
-        if prompt:
-            urls = image_urls(section)
-            result.append({"id": f"md-{order + 1}", "title": title, "prompt": prompt, "category": category, "preview": urls[0] if urls else "", "sort_order": order})
-    return result
-
-
-def parse_html(payload: bytes) -> list[dict[str, Any]]:
-    text = payload.decode("utf-8-sig", errors="replace")
-    blocks = re.findall(r"<(?:article|section)\b[^>]*>(.*?)</(?:article|section)>", text, re.S | re.I)
-    if not blocks:
-        blocks = re.findall(r"<div\b[^>]*class=[\"'][^\"']*(?:prompt|card|item)[^\"']*[\"'][^>]*>(.*?)</div>", text, re.S | re.I)
-    result = []
-    for order, block in enumerate(blocks):
-        heading = re.search(r"<h[1-4]\b[^>]*>(.*?)</h[1-4]>", block, re.S | re.I)
-        paragraphs = [clean_multiline(strip_markup(item)) for item in re.findall(r"<p\b[^>]*>(.*?)</p>", block, re.S | re.I)]
-        paragraphs = [item for item in paragraphs if item]
-        title = strip_markup(heading.group(1)) if heading else ""
-        prompt = max(paragraphs, key=len) if paragraphs else ""
-        urls = image_urls(block)
-        if title and prompt:
-            result.append({"id": f"html-{order + 1}", "title": title, "prompt": prompt, "preview": urls[0] if urls else "", "sort_order": order})
-    return result
-
-
-def normalize_item(raw: dict[str, Any], source: dict[str, str], index: int) -> dict[str, Any] | None:
-    title = clean(raw.get("title") or raw.get("title_cn") or raw.get("title_zh") or raw.get("title_en") or raw.get("name"))
-    prompt = clean_multiline(raw.get("prompt") or raw.get("content") or raw.get("text") or raw.get("positive_prompt"))
-    if not title or not prompt:
+def cached_source_definition(raw: object, fallback: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    """Normalize a source definition stored by an older or newer cache."""
+    if not isinstance(raw, dict):
         return None
-    preview = raw.get("preview") or raw.get("preview_url") or raw.get("image") or raw.get("image_url") or ""
-    preview = urljoin(source["url"], str(preview)) if preview else ""
-    item_id = clean(raw.get("id")) or hashlib.sha1(f"{title}\n{prompt}".encode()).hexdigest()[:16]
-    mode = clean(raw.get("image_mode") or raw.get("mode")).lower()
-    return {
-        "id": f"{source['id']}:{item_id}", "title": title[:160], "description": strip_markup(str(raw.get("description") or raw.get("description_cn") or raw.get("summary") or ""))[:500],
-        "prompt": prompt, "category": clean(raw.get("category_cn") or raw.get("category_zh") or raw.get("category"))[:80],
-        "sub_category": clean(raw.get("sub_category") or raw.get("subcategory"))[:80], "preview": preview[:1200],
-        "author": clean(raw.get("author"))[:120], "source_id": source["id"], "source_name": source["name"], "source_homepage": source["homepage"],
-        "image_mode": "edit" if mode in {"edit", "image-to-image", "i2i"} else "generate", "image_model": clean(raw.get("image_model") or raw.get("model"))[:80],
-        "image_size": clean(raw.get("image_size") or raw.get("size"))[:40], "image_count": raw.get("image_count") or raw.get("n") or 1, "sort_order": raw.get("sort_order", index),
+    fallback = fallback or {}
+    source_id = clean(raw.get("id") or fallback.get("id"))
+    if not re.fullmatch(r"[a-z0-9-]+", source_id):
+        return None
+    name = clean(raw.get("name") or fallback.get("name"))
+    homepage = clean(raw.get("homepage") or fallback.get("homepage"))
+    upstream_url = clean(
+        raw.get("url")
+        or raw.get("upstream_url")
+        or raw.get("upstreamUrl")
+        or fallback.get("url")
+        or fallback.get("upstream_url")
+    )
+    if not name or not homepage.startswith(("http://", "https://")) or not upstream_url.startswith(("http://", "https://")):
+        return None
+    result = {
+        **fallback,
+        "id": source_id,
+        "name": name[:160],
+        "adapter": clean(raw.get("adapter"))
+        or ("registry" if raw.get("path") or raw.get("sha256") else clean(fallback.get("adapter")))
+        or "registry",
+        "url": upstream_url,
+        "homepage": homepage,
     }
+    path = raw.get("registry_path") or raw.get("path") or fallback.get("registry_path") or fallback.get("path")
+    if path:
+        try:
+            result["registry_path"] = registry_path(path)
+        except ValueError:
+            return None
+    if "count" in raw:
+        try:
+            result["count"] = max(0, int(raw["count"]))
+        except (TypeError, ValueError):
+            result["count"] = 0
+    if "sha256" in raw and re.fullmatch(r"[a-fA-F0-9]{64}", clean(raw.get("sha256"))):
+        result["sha256"] = clean(raw.get("sha256")).lower()
+    return result
+
+
+def registry_url(path: object) -> str:
+    return f"{REGISTRY_BASE_URL.rstrip('/')}/{registry_path(path)}"
+
+
+def registry_http_url(value: object, field: str, *, allow_empty: bool = False) -> str:
+    """Validate one absolute HTTP(S) URL from the published registry."""
+    if not isinstance(value, str):
+        raise ValueError(f"prompt registry {field} must be a string")
+    value = value.strip()
+    if not value and allow_empty:
+        return ""
+    parsed = urlparse(value)
+    if (
+        not value
+        or any(char.isspace() for char in value)
+        or parsed.scheme.lower() not in {"http", "https"}
+        or not parsed.netloc
+        or not parsed.hostname
+    ):
+        raise ValueError(f"prompt registry {field} must be an absolute HTTP(S) URL")
+    return value
+
+
+def registry_source(raw: object) -> dict[str, Any]:
+    """Normalize one source entry from image-prompts/dist/manifest.json."""
+    if not isinstance(raw, dict):
+        raise ValueError("prompt registry source must be an object")
+    if set(raw) != REGISTRY_SOURCE_FIELDS:
+        raise ValueError("prompt registry source fields do not match schema version 1")
+    source_id = clean(raw.get("id"))
+    if not re.fullmatch(r"[a-z0-9-]+", source_id):
+        raise ValueError(f"invalid prompt registry source id: {source_id[:80]}")
+    name = clean(raw.get("name"))
+    homepage = registry_http_url(raw.get("homepage"), "source homepage")
+    upstream_url = registry_http_url(raw.get("upstreamUrl"), "source upstreamUrl")
+    path = registry_path(raw.get("path"))
+    count = raw.get("count")
+    if isinstance(count, bool) or not isinstance(count, int):
+        raise ValueError(f"invalid prompt registry source count: {source_id}")
+    digest = clean(raw.get("sha256")).lower()
+    if not name:
+        raise ValueError(f"prompt registry source is missing a name: {source_id}")
+    if count < 0 or not re.fullmatch(r"[a-f0-9]{64}", digest):
+        raise ValueError(f"invalid prompt registry source metadata: {source_id}")
+    return {
+        "id": source_id,
+        "name": name[:160],
+        "adapter": "registry",
+        "url": upstream_url,
+        "homepage": homepage,
+        "registry_path": path,
+        "count": count,
+        "sha256": digest,
+    }
+
+
+def registry_source_snapshot(sources: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Serialize normalized source metadata in the cache's registry section."""
+    return [
+        {
+            "id": source["id"],
+            "name": source["name"],
+            "homepage": source["homepage"],
+            "upstreamUrl": source["url"],
+            "count": source.get("count", 0),
+            "path": source.get("registry_path", ""),
+            "sha256": source.get("sha256", ""),
+        }
+        for source in sources
+    ]
+
+
+def parse_registry_manifest(payload: bytes) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
+    try:
+        data = json.loads(payload.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("prompt registry manifest is not valid JSON") from exc
+    if not isinstance(data, dict) or isinstance(data.get("schemaVersion"), bool) or data.get("schemaVersion") != 1:
+        raise ValueError("unsupported prompt registry schema")
+    if set(data) != REGISTRY_MANIFEST_FIELDS:
+        raise ValueError("prompt registry manifest fields do not match schema version 1")
+    revision = clean(data.get("registryHash")).lower()
+    generated_at = clean(data.get("generatedAt"))
+    prompts_path = registry_path(data.get("promptsPath"))
+    raw_sources = data.get("sources")
+    if not re.fullmatch(r"[a-f0-9]{64}", revision) or not generated_at:
+        raise ValueError("prompt registry manifest is missing a valid revision")
+    if not isinstance(raw_sources, list) or not raw_sources:
+        raise ValueError("prompt registry manifest has no sources")
+    sources = [registry_source(raw) for raw in raw_sources]
+    source_ids = [source["id"] for source in sources]
+    if len(source_ids) != len(set(source_ids)):
+        raise ValueError("prompt registry manifest contains duplicate sources")
+    total = data.get("total")
+    if isinstance(total, bool) or not isinstance(total, int):
+        raise ValueError("prompt registry manifest has an invalid total")
+    if total < 0 or total != sum(source["count"] for source in sources):
+        raise ValueError("prompt registry manifest total does not match source counts")
+    return {
+        "revision": revision,
+        "generated_at": generated_at,
+        "prompts_path": prompts_path,
+        "total": total,
+    }, sources, raw_sources
+
+
+def registry_created_at(value: object) -> str:
+    """Normalize and validate the registry's date/date-time contract."""
+    if not isinstance(value, str):
+        raise ValueError("prompt registry createdAt must be a string")
+    value = clean(value)
+    if not value:
+        return ""
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("prompt registry createdAt has an invalid date") from exc
+        return value
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", value):
+        raise ValueError("prompt registry createdAt must be a date or RFC 3339 date-time")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    except ValueError as exc:
+        raise ValueError("prompt registry createdAt has an invalid date-time") from exc
+    if parsed.tzinfo is None:
+        raise ValueError("prompt registry createdAt must include an explicit offset")
+    return value
+
+
+def normalize_registry_item(raw: object, source: dict[str, Any], index: int) -> dict[str, Any]:
+    """Validate one schema-v1 registry record and map it to Prompt Studio fields.
+
+    The registry is already normalized upstream, so this path deliberately does
+    not apply the permissive aliases used by the legacy source adapters. That
+    keeps a malformed or unexpectedly extended payload from silently changing
+    the prompt library.
+    """
+    if not isinstance(raw, dict):
+        raise ValueError("prompt registry item must be an object")
+    keys = set(raw)
+    unknown = keys - REGISTRY_ITEM_FIELDS
+    missing = REGISTRY_REQUIRED_ITEM_FIELDS - keys
+    if unknown:
+        raise ValueError(f"prompt registry item contains unknown fields: {', '.join(sorted(map(str, unknown)))}")
+    if missing:
+        raise ValueError(f"prompt registry item is missing fields: {', '.join(sorted(missing))}")
+
+    source_id = raw["sourceId"]
+    item_id = raw["id"]
+    if not isinstance(source_id, str) or source_id != source["id"]:
+        raise ValueError("prompt registry item has an invalid sourceId")
+    if not isinstance(item_id, str) or not re.fullmatch(rf"{re.escape(source_id)}:[a-f0-9]{{16}}", item_id):
+        raise ValueError(f"prompt registry item has an invalid id/source pair: {str(item_id)[:120]}")
+
+    scalar_fields = (
+        "title",
+        "prompt",
+        "description",
+        "author",
+        "createdAt",
+        "imageMode",
+        "imageModel",
+        "coverUrl",
+        "sourceUrl",
+    )
+    for field in scalar_fields:
+        if not isinstance(raw[field], str):
+            raise ValueError(f"prompt registry item field {field} must be a string")
+    title = clean(raw["title"])
+    prompt = clean_multiline(raw["prompt"])
+    description = clean_multiline(raw["description"])
+    if not title or not prompt:
+        raise ValueError("prompt registry item title and prompt cannot be empty")
+
+    cover_url = registry_http_url(raw["coverUrl"], "coverUrl", allow_empty=True)
+    source_url = registry_http_url(raw["sourceUrl"], "sourceUrl")
+    raw_references = raw["referenceImageUrls"]
+    if not isinstance(raw_references, list):
+        raise ValueError("prompt registry referenceImageUrls must be an array")
+    references: list[str] = []
+    for value in raw_references:
+        reference = registry_http_url(value, "referenceImageUrls[]")
+        if reference in references:
+            raise ValueError("prompt registry referenceImageUrls must be unique")
+        references.append(reference)
+
+    raw_tags = raw["tags"]
+    if not isinstance(raw_tags, list):
+        raise ValueError("prompt registry tags must be an array")
+    tags: list[str] = []
+    for value in raw_tags:
+        if not isinstance(value, str):
+            raise ValueError("prompt registry tags must contain strings")
+        tag = clean(value)
+        if not tag:
+            raise ValueError("prompt registry tags cannot contain empty values")
+        if tag in tags:
+            raise ValueError("prompt registry tags must be unique")
+        tags.append(tag)
+
+    created_at = registry_created_at(raw["createdAt"])
+    image_mode = clean(raw["imageMode"])
+    if image_mode not in {"", "generate", "edit"}:
+        raise ValueError("prompt registry imageMode is invalid")
+    image_model = clean(raw["imageModel"])
+
+    image_size: str | None = None
+    if "imageSize" in raw:
+        if not isinstance(raw["imageSize"], str):
+            raise ValueError("prompt registry imageSize must be a string")
+        image_size = clean(raw["imageSize"])
+        if not image_size:
+            raise ValueError("prompt registry imageSize cannot be empty when present")
+
+    image_count: int | None = None
+    if "imageCount" in raw:
+        value = raw["imageCount"]
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ValueError("prompt registry imageCount must be a positive integer")
+        image_count = value
+
+    # Registry tags are the only category signal in the public contract. Keep
+    # the first two labels in the legacy category fields for existing filters.
+    result: dict[str, Any] = {
+        "id": item_id,
+        "title": title[:160],
+        "description": description[:500],
+        "prompt": prompt,
+        "category": tags[0][:80] if tags else "",
+        "sub_category": tags[1][:80] if len(tags) > 1 else "",
+        "preview": cover_url[:1200],
+        "author": clean(raw["author"])[:120],
+        "source_id": source["id"],
+        "source_name": source["name"],
+        "source_homepage": source["homepage"],
+        "source_url": source_url[:1200],
+        "reference_image_urls": references[:12],
+        "tags": tags[:24],
+        # An empty imageMode is meaningful: it means the upstream source did
+        # not specify whether the prompt generates or edits an image.
+        "image_mode": image_mode,
+        "image_model": image_model[:80],
+        "created_at": created_at,
+        "sort_order": index,
+    }
+    if image_size is not None:
+        result["image_size"] = image_size[:40]
+    if image_count is not None:
+        result["image_count"] = image_count
+    return result
 
 
 class Library:
@@ -452,21 +686,115 @@ class Library:
         self.sources = [{**source, "status": "waiting", "count": 0, "error": "", "synced_at": ""} for source in SOURCES]
         self.syncing = False
         self.synced_at = ""
+        self.registry_revision = ""
+        self.registry_generated_at = ""
         self.load()
 
     def load(self) -> None:
         try:
             data = json.loads(CACHE_PATH.read_text(encoding="utf-8"))
-            self.items = data.get("items", [])
-            cached = {item["id"]: item for item in data.get("sources", [])}
-            self.sources = [{**source, **cached.get(source["id"], {})} for source in SOURCES]
+            if not isinstance(data, dict):
+                return
+            raw_items = data.get("items", [])
+            self.items = [item for item in raw_items if isinstance(item, dict)] if isinstance(raw_items, list) else []
+            cached_sources = data.get("sources", [])
+            if not isinstance(cached_sources, list):
+                cached_sources = []
+            cached = {
+                clean(item.get("id")): item
+                for item in cached_sources
+                if isinstance(item, dict) and clean(item.get("id"))
+            }
+            registry = data.get("registry") if isinstance(data.get("registry"), dict) else {}
+            registry_sources = registry.get("sources", []) if isinstance(registry.get("sources"), list) else []
+            fallback_by_id = {source["id"]: source for source in SOURCES}
+            definitions: dict[str, dict[str, Any]] = {}
+            # Start with the older top-level records for migration and let the
+            # registry snapshot win last so stale cache metadata cannot replace
+            # the names, URLs, or paths declared by the manifest.
+            for raw in [*cached_sources, *registry_sources]:
+                source_id = clean(raw.get("id")) if isinstance(raw, dict) else ""
+                definition = cached_source_definition(raw, fallback_by_id.get(source_id))
+                if definition:
+                    definitions[source_id] = definition
+            for source in SOURCES:
+                definitions.setdefault(source["id"], dict(source))
+            self.sources = []
+            for source_id, source in definitions.items():
+                cached_state = cached.get(source_id, {})
+                state: dict[str, Any] = {
+                    "status": "waiting",
+                    "count": 0,
+                    "error": "",
+                    "synced_at": "",
+                    "fetch_ms": 0,
+                }
+                if isinstance(cached_state.get("status"), str):
+                    state["status"] = clean(cached_state.get("status")) or "waiting"
+                try:
+                    state["count"] = max(0, int(cached_state.get("count", 0)))
+                except (TypeError, ValueError):
+                    state["count"] = 0
+                state["error"] = clean(cached_state.get("error"))[:300]
+                state["synced_at"] = clean(cached_state.get("synced_at"))
+                try:
+                    state["fetch_ms"] = max(0, int(cached_state.get("fetch_ms", 0)))
+                except (TypeError, ValueError):
+                    state["fetch_ms"] = 0
+                self.sources.append({
+                    **source,
+                    **state,
+                })
             self.synced_at = data.get("synced_at", "")
+            self.registry_revision = clean(registry.get("revision"))
+            self.registry_generated_at = clean(registry.get("generated_at"))
         except (OSError, ValueError, KeyError):
             pass
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
-            return {"sources": self.sources, "syncing": self.syncing, "synced_at": self.synced_at, "prompt_count": len(self.items)}
+            return {
+                "sources": self.sources,
+                "syncing": self.syncing,
+                "synced_at": self.synced_at,
+                "prompt_count": len(self.items),
+                "registry_revision": self.registry_revision,
+                "registry_generated_at": self.registry_generated_at,
+            }
+
+    def needs_registry_sync(self) -> bool:
+        """Whether the cache lacks a valid registry snapshot marker."""
+        with self.lock:
+            return (
+                not re.fullmatch(r"[a-f0-9]{64}", self.registry_revision.lower())
+                or not self.sources
+            )
+
+    def _cache_payload(self) -> dict[str, Any]:
+        return {
+            "items": self.items,
+            "sources": self.sources,
+            "synced_at": self.synced_at,
+            "registry": {
+                "url": REGISTRY_BASE_URL,
+                "revision": self.registry_revision,
+                "generated_at": self.registry_generated_at,
+                "sources": registry_source_snapshot(self.sources),
+            },
+        }
+
+    def _write_cache(self) -> None:
+        """Persist the current library without ever exposing a partial JSON file."""
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        temporary = CACHE_PATH.with_name(f".{CACHE_PATH.name}.{secrets.token_hex(8)}.tmp")
+        try:
+            with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(self._cache_payload(), handle, ensure_ascii=False, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary.replace(CACHE_PATH)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def page(self, offset: int, limit: int, keyword: str = "", source_id: str = "", category: str = "") -> dict[str, Any]:
         if offset < 0 or not 1 <= limit <= 60:
@@ -474,7 +802,7 @@ class Library:
         keyword = clean(keyword)[:200].casefold()
         source_id = clean(source_id)
         category = clean(category)
-        valid_source_ids = {source["id"] for source in SOURCES}
+        valid_source_ids = {source["id"] for source in self.sources}
         if source_id and source_id not in valid_source_ids:
             raise ValueError("unknown prompt source")
 
@@ -499,8 +827,9 @@ class Library:
         with self.lock:
             return next((dict(item) for item in self.items if item.get("id") == item_id), None)
 
-    def fetch(self, source: dict[str, str]) -> tuple[list[dict[str, Any]], str]:
-        parsed = urlparse(source["url"])
+    @staticmethod
+    def download(url: str, max_bytes: int, *, timeout: int = SOURCE_TIMEOUT) -> bytes:
+        parsed = urlparse(url)
         if parsed.scheme != "https" or not parsed.hostname:
             raise ValueError("only HTTPS prompt sources are allowed")
         try:
@@ -510,63 +839,149 @@ class Library:
         except ValueError as exc:
             if "does not appear" not in str(exc):
                 raise
-        request = Request(source["url"], headers={"User-Agent": "klong-prompt-studio/1.0", "Accept": "application/json,text/markdown,text/html,text/plain"})
-        with urlopen(request, timeout=SOURCE_TIMEOUT) as response:
-            payload = response.read(MAX_SOURCE_BYTES + 1)
-        if len(payload) > MAX_SOURCE_BYTES:
-            raise ValueError("prompt source exceeds 4 MiB")
-        adapter = source["adapter"]
-        raw_items = parse_json(payload) if adapter == "json" else parse_markdown(payload) if adapter == "markdown" else parse_html(payload)
-        items = [item for index, raw in enumerate(raw_items) if (item := normalize_item(raw, source, index))]
-        if not items:
-            raise ValueError("source returned no usable prompts")
-        return items, adapter
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "klong-prompt-studio/2.0",
+                "Accept": "application/json,text/markdown,text/html,text/plain",
+            },
+        )
+        with urlopen(request, timeout=timeout) as response:
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    declared_length = int(content_length)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("prompt source returned an invalid content length") from exc
+                if declared_length > max_bytes:
+                    raise ValueError(f"prompt source exceeds {max_bytes} bytes")
+            payload = response.read(max_bytes + 1)
+        if len(payload) > max_bytes:
+            raise ValueError(f"prompt source exceeds {max_bytes} bytes")
+        return payload
+
+    def fetch_registry(self) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, list[dict[str, Any]]]]:
+        """Fetch and validate the atomic image-prompts registry snapshot."""
+        manifest_payload = self.download(
+            registry_url("manifest.json"),
+            REGISTRY_MANIFEST_MAX_BYTES,
+            timeout=REGISTRY_TIMEOUT,
+        )
+        manifest, sources, raw_sources = parse_registry_manifest(manifest_payload)
+        payload = self.download(
+            registry_url(manifest["prompts_path"]),
+            REGISTRY_PAYLOAD_MAX_BYTES,
+            timeout=REGISTRY_TIMEOUT,
+        )
+        expected_hash = hashlib.sha256(
+            json.dumps(raw_sources, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8") + payload
+        ).hexdigest()
+        if expected_hash != manifest["revision"]:
+            raise ValueError("prompt registry manifest and payload hashes do not match")
+        try:
+            raw_items = json.loads(payload.decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("prompt registry payload is not valid JSON") from exc
+        if not isinstance(raw_items, list) or len(raw_items) != manifest["total"]:
+            raise ValueError("prompt registry payload count does not match the manifest")
+        sources_by_id = {source["id"]: source for source in sources}
+        grouped: dict[str, list[dict[str, Any]]] = {source_id: [] for source_id in sources_by_id}
+        seen_ids: set[str] = set()
+        for index, raw in enumerate(raw_items):
+            if not isinstance(raw, dict):
+                raise ValueError("prompt registry payload contains a non-object item")
+            source_id = raw.get("sourceId") if isinstance(raw.get("sourceId"), str) else ""
+            source = sources_by_id.get(source_id)
+            if source is None:
+                raise ValueError(f"prompt registry item references unknown source: {source_id[:80]}")
+            item = normalize_registry_item(raw, source, len(grouped[source_id]))
+            if item["id"] in seen_ids:
+                raise ValueError(f"prompt registry item id is duplicated: {item['id'][:120]}")
+            seen_ids.add(item["id"])
+            grouped[source_id].append(item)
+        for source in sources:
+            if len(grouped[source["id"]]) != source["count"]:
+                raise ValueError(f"prompt registry source count does not match: {source['id']}")
+        return manifest, sources, grouped
 
     def sync(self, source_id: str = "") -> None:
         with self.lock:
             if self.syncing:
                 return
             self.syncing = True
-            selected_sources = [source for source in SOURCES if not source_id or source["id"] == source_id]
-            if not selected_sources:
+            known_source_ids = {source["id"] for source in self.sources}
+            if source_id and source_id not in known_source_ids:
                 self.syncing = False
                 return
+            # The upstream registry is one atomic snapshot. A source-scoped UI
+            # refresh therefore updates every known source once the new
+            # manifest succeeds, and reports an all-source failure otherwise.
+            selected_ids = known_source_ids
             for source in self.sources:
-                if source["id"] not in {item["id"] for item in selected_sources}:
+                if source["id"] not in selected_ids:
                     continue
                 source.update(status="syncing", error="")
-        old_by_source: dict[str, list[dict[str, Any]]] = {}
-        for item in self.items:
-            old_by_source.setdefault(item.get("source_id", ""), []).append(item)
-        fetched: dict[str, list[dict[str, Any]]] = dict(old_by_source)
-        with ThreadPoolExecutor(max_workers=SYNC_WORKERS) as executor:
-            futures = {executor.submit(self.fetch, source): source for source in selected_sources}
-            for future in as_completed(futures):
-                source = futures[future]
-                try:
-                    items, _ = future.result()
-                    fetched[source["id"]] = items
-                    status, error = "ready", ""
-                except (OSError, ValueError, HTTPError, URLError, json.JSONDecodeError) as exc:
-                    fetched[source["id"]] = old_by_source.get(source["id"], [])
-                    status, error = ("cached" if fetched[source["id"]] else "error"), str(exc)[:300]
-                with self.lock:
-                    target = next(item for item in self.sources if item["id"] == source["id"])
-                    target.update(status=status, error=error, count=len(fetched[source["id"]]), synced_at=now_iso() if status == "ready" else target.get("synced_at", ""))
-        combined, seen = [], set()
-        for source in SOURCES:
-            for item in fetched.get(source["id"], []):
-                fingerprint = hashlib.sha1(clean(item.get("prompt")).lower().encode()).hexdigest()
-                if fingerprint not in seen:
-                    seen.add(fingerprint)
+            old_by_source: dict[str, list[dict[str, Any]]] = {}
+            for item in self.items:
+                old_by_source.setdefault(item.get("source_id", ""), []).append(item)
+
+        def combine(source_order: list[dict[str, Any]], fetched: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+            combined, seen = [], set()
+            for source in source_order:
+                for item in fetched.get(source["id"], []):
+                    # Registry records have stable IDs. Keep records from different
+                    # sources even when their prompt text happens to be identical.
+                    item_id = clean(item.get("id"))
+                    if item_id in seen:
+                        continue
+                    seen.add(item_id)
                     combined.append(item)
-        with self.lock:
-            if combined:
+            return combined
+
+        try:
+            started = time.monotonic()
+            manifest, registry_sources, grouped = self.fetch_registry()
+            elapsed_ms = int((time.monotonic() - started) * 1000)
+            synced_at = now_iso()
+            with self.lock:
+                # The registry is an atomic snapshot. Even a source-scoped refresh
+                # replaces all records so the revision and cached items cannot drift
+                # apart when another source changed in the same publication.
+                fetched = grouped
+                merged_sources = []
+                for source in registry_sources:
+                    items = fetched.get(source["id"], [])
+                    merged_sources.append({
+                        **source,
+                        "status": "ready",
+                        "count": len(items),
+                        "error": "",
+                        "synced_at": synced_at,
+                        "fetch_ms": elapsed_ms,
+                    })
+                combined = combine(merged_sources, fetched)
                 self.items = combined
-            self.synced_at = now_iso()
-            self.syncing = False
-            CACHE_DIR.mkdir(parents=True, exist_ok=True)
-            CACHE_PATH.write_text(json.dumps({"items": self.items, "sources": self.sources, "synced_at": self.synced_at}, ensure_ascii=False), encoding="utf-8")
+                self.sources = merged_sources
+                self.registry_revision = manifest["revision"]
+                self.registry_generated_at = manifest["generated_at"]
+                self.synced_at = synced_at
+                self.syncing = False
+                self._write_cache()
+        except Exception as exc:
+            error = str(exc)[:300] or exc.__class__.__name__
+            with self.lock:
+                for source in self.sources:
+                    if source["id"] not in selected_ids:
+                        continue
+                    cached_items = old_by_source.get(source["id"], [])
+                    source.update(
+                        status="cached" if cached_items else "error",
+                        count=len(cached_items),
+                        error=error,
+                    )
+                self.synced_at = now_iso()
+                self.syncing = False
+                self._write_cache()
 
 
 class Settings:
@@ -1868,7 +2283,7 @@ def main() -> int:
         secrets.token_urlsafe(24),
         storage_state,
     )
-    if not library.items or args.refresh:
+    if not library.items or args.refresh or library.needs_registry_sync():
         threading.Thread(target=library.sync, daemon=True).start()
     url = f"http://{args.host}:{server.server_address[1]}"
     print(f"小恐龙图像工作台: {url}")
