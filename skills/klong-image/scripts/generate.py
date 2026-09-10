@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import json
 import os
 import random
@@ -26,31 +27,50 @@ from generation_manifest import now_iso, record_generation_manifest, validate_jo
 from image_sizes import constrain_image_size
 
 
-OPENAI_MODELS = {
-    "gpt-image-2",
-    "gpt-image-2-exact",
-    "gpt-image-2-high",
-    "gpt-image-2-c",
-    "gpt-image-2-vip",
+MODEL_ID_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{0,119}$")
+GEMINI_RATIOS = {
+    "1:1", "2:3", "3:2", "3:4", "4:3", "5:4", "4:5", "9:16", "16:9", "21:9",
+    "8:1", "4:1", "1:4", "1:8",
 }
-GEMINI_MODELS = {
-    "gemini-3-pro-image-preview",
-    "gemini-3-pro-image-preview-c",
-    "gemini-3.1-flash-image-preview",
-    "gemini-3.1-flash-image-preview-c",
+QUALITY_OPTIONS = {
+    "gpt-image-2-high": {"medium", "high"},
+    "gpt-image-2.5-flare": {"low", "medium", "high", "xhigh", "max"},
+    "gpt-image-2.5-sunburst": {"low", "medium", "high", "xhigh", "max"},
 }
-GEMINI_ENTERPRISE_MODELS = {
-    "gemini-3-pro-image-preview-c",
-    "gemini-3.1-flash-image-preview-c",
-}
-GEMINI_RATIOS = {"1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9", "21:9", "8:1", "4:1", "1:4", "1:8"}
 DEFAULT_OPENAI_MODEL = "gpt-image-2"
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_INPUT_BYTES = 20 * 1024 * 1024
 USER_AGENT = "klong-image-skill/0.1"
-SUPPORTED_MODELS = OPENAI_MODELS | GEMINI_MODELS
-SERIAL_MODELS = {"gpt-image-2-vip"}
 DEFAULT_OUTPUT_DIR = Path(resolve_output_directory()["path"])
+
+
+def image_model_protocol(value: object) -> str | None:
+    """Infer the documented image transport without a brittle model allowlist."""
+    model = str(value or "").strip().lower()
+    if not MODEL_ID_PATTERN.fullmatch(model):
+        return None
+    if model.startswith("gpt-image-") and "-codex" not in model:
+        return "openai"
+    if model.startswith("nano-banana"):
+        return "openai"
+    if model.startswith("gemini-") and "image" in model:
+        return "gemini"
+    return None
+
+
+def is_exact_image_model(value: object) -> bool:
+    model = str(value or "").strip().lower()
+    return model.startswith("gpt-image-") and model.endswith("-exact")
+
+
+def is_nano_banana_model(value: object) -> bool:
+    return str(value or "").strip().lower().startswith("nano-banana")
+
+
+def api_endpoint(base_url: str, path: str) -> str:
+    if not path.startswith("/"):
+        raise ValueError("API endpoint path must start with /")
+    return f"{validate_base_url(base_url)}{path}"
 
 
 class TransientError(RuntimeError):
@@ -279,7 +299,7 @@ def multipart_body(fields: dict[str, str], filename: str, content: bytes, mime_t
     return b"".join(chunks), boundary
 
 
-def request_multipart(url: str, api_key: str, body: bytes, boundary: str, timeout: int) -> dict:
+def request_multipart(url: str, api_key: str, body: bytes, boundary: str, timeout: int) -> dict | list:
     request = urllib.request.Request(
         url,
         data=body,
@@ -303,7 +323,7 @@ def request_multipart(url: str, api_key: str, body: bytes, boundary: str, timeou
         raise TransientError(f"Network error: {exc.reason}") from exc
 
 
-def request_json(url: str, headers: dict[str, str], payload: dict | None, timeout: int) -> dict:
+def request_json(url: str, headers: dict[str, str], payload: dict | None, timeout: int) -> dict | list:
     data = None if payload is None else json.dumps(payload, ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(url, data=data, headers={"User-Agent": USER_AGENT, **headers}, method="GET" if data is None else "POST")
     try:
@@ -321,12 +341,32 @@ def request_json(url: str, headers: dict[str, str], payload: dict | None, timeou
 
 def list_models(base_url: str, api_key: str, timeout: int) -> list[str]:
     result = request_json(
-        f"{base_url}/v1/models",
+        api_endpoint(base_url, "/v1/models"),
         {"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
         None,
         timeout,
     )
-    return sorted(item["id"] for item in result.get("data", []) if isinstance(item, dict) and item.get("id") in SUPPORTED_MODELS)
+    if isinstance(result, list):
+        raw_models = result
+    elif isinstance(result, dict):
+        if isinstance(result.get("data"), list):
+            raw_models = result["data"]
+        elif isinstance(result.get("models"), list):
+            raw_models = result["models"]
+        else:
+            raise RuntimeError("Model API response did not contain a model array")
+    else:
+        raise RuntimeError("Model API response did not contain a model array")
+
+    models: list[str] = []
+    seen: set[str] = set()
+    for item in raw_models:
+        model = item if isinstance(item, str) else item.get("id") if isinstance(item, dict) else ""
+        model = str(model or "").strip()
+        if model and model not in seen and image_model_protocol(model):
+            seen.add(model)
+            models.append(model)
+    return models
 
 
 def check_model(base_url: str, api_key: str, model: str, protocol: str, timeout: int) -> None:
@@ -334,6 +374,34 @@ def check_model(base_url: str, api_key: str, model: str, protocol: str, timeout:
     if model not in available:
         raise RuntimeError(f"Model is not available to this key: {model}")
     print(json.dumps({"available": True, "model": model, "protocol": protocol}, ensure_ascii=False))
+
+
+def download_image_url(image_url: object, timeout: int) -> tuple[bytes, str]:
+    url = str(image_url or "").strip()
+    if not url.lower().startswith(("https://", "http://")):
+        raise RuntimeError("The API returned an unsupported image URL")
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return read_limited(response), response.headers.get_content_type()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 429 or 500 <= exc.code <= 599:
+            raise TransientError(f"Image download returned HTTP {exc.code}") from exc
+        raise RuntimeError(f"Image download returned HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise TransientError(f"Image download failed: {exc.reason}") from exc
+
+
+def decode_base64_image(value: object, source: str) -> bytes:
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"{source} was not a non-empty Base64 string")
+    try:
+        content = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise RuntimeError(f"{source} contained invalid Base64 image data") from exc
+    if not content:
+        raise RuntimeError(f"{source} decoded to an empty image")
+    return content
 
 
 def generate_openai(base_url: str, api_key: str, args: argparse.Namespace) -> tuple[bytes, str]:
@@ -346,7 +414,7 @@ def generate_openai(base_url: str, api_key: str, args: argparse.Namespace) -> tu
         body, boundary = multipart_body(
             fields, args.input_image_path.name, args.input_image_bytes, args.input_image_mime
         )
-        result = request_multipart(f"{base_url}/v1/images/edits", api_key, body, boundary, args.timeout)
+        result = request_multipart(api_endpoint(base_url, "/v1/images/edits"), api_key, body, boundary, args.timeout)
     else:
         payload = {"model": args.model, "prompt": args.prompt, "n": 1}
         if args.size:
@@ -354,32 +422,24 @@ def generate_openai(base_url: str, api_key: str, args: argparse.Namespace) -> tu
         if args.quality:
             payload["quality"] = args.quality
         result = request_json(
-            f"{base_url}/v1/images/generations",
+            api_endpoint(base_url, "/v1/images/generations"),
             {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
             payload,
             args.timeout,
         )
-    items = result.get("data") or []
-    if not items:
+    if not isinstance(result, dict):
+        raise RuntimeError("OpenAI-compatible response was not a JSON object")
+    items = result.get("data")
+    if not isinstance(items, list) or not items:
         raise RuntimeError("OpenAI-compatible response did not contain data[0]")
     item = items[0]
+    if not isinstance(item, dict):
+        raise RuntimeError("OpenAI-compatible response data[0] was not an object")
     if item.get("b64_json"):
-        content = base64.b64decode(item["b64_json"])
+        content = decode_base64_image(item["b64_json"], "OpenAI-compatible response data[0].b64_json")
         return content, output_image_mime(content, "image/png")
     if item.get("url"):
-        image_url = item["url"]
-        if not isinstance(image_url, str) or not image_url.lower().startswith(("https://", "http://")):
-            raise RuntimeError("The API returned an unsupported image URL")
-        request = urllib.request.Request(image_url, headers={"User-Agent": USER_AGENT})
-        try:
-            with urllib.request.urlopen(request, timeout=args.timeout) as response:
-                return read_limited(response), response.headers.get_content_type()
-        except urllib.error.HTTPError as exc:
-            if exc.code == 429 or 500 <= exc.code <= 599:
-                raise TransientError(f"Image download returned HTTP {exc.code}") from exc
-            raise RuntimeError(f"Image download returned HTTP {exc.code}") from exc
-        except urllib.error.URLError as exc:
-            raise TransientError(f"Image download failed: {exc.reason}") from exc
+        return download_image_url(item["url"], args.timeout)
     raise RuntimeError("OpenAI-compatible response contained neither b64_json nor url")
 
 
@@ -400,25 +460,47 @@ def generate_gemini(base_url: str, api_key: str, args: argparse.Namespace) -> tu
         image_config["imageSize"] = args.image_size
     if image_config:
         generation_config["imageConfig"] = image_config
-    if args.model not in GEMINI_ENTERPRISE_MODELS and image_config:
-        generation_config["responseFormat"] = {"image": dict(image_config)}
     payload = {
         "contents": [{"role": "user", "parts": request_parts}],
         "generationConfig": generation_config,
     }
     result = request_json(
-        f"{base_url}/v1beta/models/{args.model}:generateContent",
+        api_endpoint(base_url, f"/v1beta/models/{args.model}:generateContent"),
         {"x-goog-api-key": api_key, "Content-Type": "application/json"},
         payload,
         args.timeout,
     )
-    candidates = result.get("candidates") or []
-    parts = candidates[0].get("content", {}).get("parts", []) if candidates else []
+    if not isinstance(result, dict):
+        raise RuntimeError("Gemini response was not a JSON object")
+    candidates = result.get("candidates")
+    parts: list[dict] = []
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            content = candidate.get("content") if isinstance(candidate, dict) else None
+            candidate_parts = content.get("parts") if isinstance(content, dict) else None
+            if isinstance(candidate_parts, list):
+                parts.extend(part for part in candidate_parts if isinstance(part, dict))
+
+    for part in parts:
+        file_data = part.get("fileData") or part.get("file_data")
+        if isinstance(file_data, dict):
+            image_url = file_data.get("fileUri") or file_data.get("file_uri")
+            if image_url:
+                return download_image_url(image_url, args.timeout)
+
+    markdown_image = re.compile(r"!\[[^\]]*\]\(\s*<?(https?://[^)\s>]+)>?\s*\)", re.IGNORECASE)
+    for part in parts:
+        text = part.get("text")
+        match = markdown_image.search(text) if isinstance(text, str) else None
+        if match:
+            return download_image_url(match.group(1), args.timeout)
+
     for part in parts:
         inline = part.get("inlineData") or part.get("inline_data")
-        if inline and inline.get("data"):
-            return base64.b64decode(inline["data"]), inline.get("mimeType") or inline.get("mime_type") or "image/png"
-    raise RuntimeError("Gemini response did not contain inline image data")
+        if isinstance(inline, dict) and inline.get("data"):
+            content = decode_base64_image(inline["data"], "Gemini inline image data")
+            return content, inline.get("mimeType") or inline.get("mime_type") or "image/png"
+    raise RuntimeError("Gemini response did not contain a file URL, Markdown image URL, or inline image data")
 
 
 def parse_args() -> argparse.Namespace:
@@ -441,8 +523,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--connection-id", default="", help=argparse.SUPPRESS)
     parser.add_argument("--connection-name", default="", help=argparse.SUPPRESS)
     parser.add_argument("--input-image", help="PNG, JPEG, or WebP source image for image-to-image editing.")
-    parser.add_argument("--size", help="OpenAI-compatible size, for example 1024x1024.")
-    parser.add_argument("--quality", choices=("medium", "high"), help="gpt-image-2-high quality; VIP is fixed to medium.")
+    parser.add_argument(
+        "--size",
+        help="OpenAI-compatible size, for example 1024x1024; Nano Banana also accepts ratios or 1K/2K/4K.",
+    )
+    parser.add_argument(
+        "--quality",
+        choices=("low", "medium", "high", "xhigh", "max"),
+        help="Quality for gpt-image-2-high or official GPT Image 2.5 Flare/Sunburst routes.",
+    )
     parser.add_argument("--aspect-ratio", choices=sorted(GEMINI_RATIOS), help="Gemini native aspect ratio.")
     parser.add_argument("--image-size", choices=("1K", "2K", "4K"), help="Gemini native resolution tier.")
     parser.add_argument("--base-url", help="Override the API base URL from the active connection.")
@@ -496,39 +585,56 @@ def parse_args() -> argparse.Namespace:
 
 
 def configure_runtime(args: argparse.Namespace, connection: dict[str, str]) -> None:
-    args.model = args.model or connection.get("default_model") or DEFAULT_OPENAI_MODEL
     args.base_url = validate_base_url(args.base_url or connection.get("base_url"))
     args.connection_id = args.connection_id or connection.get("id") or ""
     args.connection_name = args.connection_name or connection.get("name") or ""
-    if args.model not in SUPPORTED_MODELS:
-        raise ValueError(f"Model is not supported by this Skill: {args.model}")
-    expected_protocol = "gemini" if args.model in GEMINI_MODELS else "openai"
+    if args.timeout is None:
+        args.timeout = 600
+    if getattr(args, "list_models", False):
+        return
+
+    args.model = args.model or connection.get("default_model") or DEFAULT_OPENAI_MODEL
+    expected_protocol = image_model_protocol(args.model)
+    if not expected_protocol:
+        raise ValueError(f"Model is not recognized as an image model by this Skill: {args.model}")
     if args.protocol == "auto":
         args.protocol = expected_protocol
     elif args.protocol != expected_protocol:
         raise ValueError(f"{args.model} requires the {expected_protocol} protocol")
-    if args.timeout is None:
-        args.timeout = 600
-    if args.model in SERIAL_MODELS and args.concurrency != 1:
-        raise ValueError(f"{args.model} only supports --concurrency 1")
     if args.protocol == "gemini" and args.size:
         raise ValueError("--size is only supported for OpenAI-compatible models; use --aspect-ratio and --image-size for Gemini")
     if args.protocol != "gemini" and (args.aspect_ratio or args.image_size):
         raise ValueError("--aspect-ratio and --image-size are only supported for Gemini models")
-    if args.quality and args.model != "gpt-image-2-high":
-        raise ValueError("--quality is only configurable for gpt-image-2-high")
+    quality_options = QUALITY_OPTIONS.get(args.model.lower(), set())
+    if args.quality and args.quality not in quality_options:
+        supported = ", ".join(sorted(quality_options)) if quality_options else "none"
+        raise ValueError(f"--quality is not supported for {args.model}; accepted values: {supported}")
     args.requested_size = args.size or ""
     if args.size:
-        if args.model == "gpt-image-2-exact":
+        if is_exact_image_model(args.model):
             match = re.fullmatch(r"(\d+)\s*[xX×]\s*(\d+)", args.size)
             if not match:
-                raise ValueError("--size must use WIDTHxHEIGHT for gpt-image-2-exact")
+                raise ValueError(f"--size must use WIDTHxHEIGHT for {args.model}")
             width, height = map(int, match.groups())
             if not (64 <= width <= 4096 and 64 <= height <= 4096):
-                raise ValueError("gpt-image-2-exact width and height must each be 64-4096")
+                raise ValueError(f"{args.model} width and height must each be 64-4096")
             if width * height > 4096 * 4096:
-                raise ValueError("gpt-image-2-exact total pixels must not exceed 4096x4096")
+                raise ValueError(f"{args.model} total pixels must not exceed 4096x4096")
             args.size = f"{width}x{height}"
+            args.size_limited = False
+        elif is_nano_banana_model(args.model):
+            nano_size = args.size.strip()
+            dimensions = re.fullmatch(r"(\d+)\s*[xX×]\s*(\d+)", nano_size)
+            ratio = re.fullmatch(r"(\d+)\s*:\s*(\d+)", nano_size)
+            tier = re.fullmatch(r"([124])K", nano_size, re.IGNORECASE)
+            if dimensions and all(int(value) > 0 for value in dimensions.groups()):
+                args.size = f"{int(dimensions.group(1))}x{int(dimensions.group(2))}"
+            elif ratio and all(int(value) > 0 for value in ratio.groups()):
+                args.size = f"{int(ratio.group(1))}:{int(ratio.group(2))}"
+            elif tier:
+                args.size = f"{tier.group(1)}K"
+            else:
+                raise ValueError("Nano Banana --size must be WIDTHxHEIGHT, WIDTH:HEIGHT, or 1K/2K/4K")
             args.size_limited = False
         else:
             args.size, args.size_limited = constrain_image_size(args.size)
@@ -585,6 +691,8 @@ def main() -> int:
             "protocol": args.protocol,
             "mode": mode,
             "size": args.size or "",
+            "aspect_ratio": args.aspect_ratio or "",
+            "image_size": args.image_size or "",
         }
 
         job_context = {
@@ -598,6 +706,8 @@ def main() -> int:
             "connection_name": args.connection_name,
             "protocol": args.protocol,
             "size": args.size or "",
+            "aspect_ratio": args.aspect_ratio or "",
+            "image_size": args.image_size or "",
             "count": args.count,
             "concurrency": min(args.concurrency, args.count),
         }

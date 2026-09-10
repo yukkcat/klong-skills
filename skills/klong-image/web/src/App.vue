@@ -459,7 +459,7 @@
                 </section>
 
                 <section class="creation-control-section parameter-section">
-                  <div class="section-title"><h3>生成参数</h3><span>{{ serialModel ? '当前模型仅支持串行' : '按需调整' }}</span></div>
+                  <div class="section-title"><h3>生成参数</h3><span>按需调整</span></div>
                   <FormField label="连接">
                     <FilterSelect
                       v-model="form.connection_id"
@@ -499,10 +499,10 @@
                     <FormField label="数量"><Input v-model="form.count" type="number" min="1" size="md" block /></FormField>
                   </div>
                   <div class="field-row compact-row">
-                    <FormField label="并发"><Input v-model="form.concurrency" type="number" min="1" size="md" block :disabled="serialModel" /></FormField>
+                    <FormField label="并发"><Input v-model="form.concurrency" type="number" min="1" size="md" block /></FormField>
                     <FormField label="输出格式"><Input model-value="自动 · PNG/JPG/WebP" size="md" block disabled /></FormField>
                   </div>
-                  <FormField v-if="isHighQualityModel" label="质量">
+                  <FormField v-if="qualityOptions.length" label="质量">
                     <FilterSelect v-model="form.quality" :options="qualityOptions" size="md" placement="up" selected-indicator="check" />
                   </FormField>
                   <details class="advanced-settings">
@@ -1053,7 +1053,7 @@
                   <FormField label="连接名称">
                     <Input v-model="connectionForm.name" size="md" block :disabled="editingConnection?.readonly" placeholder="例如：主账号" />
                   </FormField>
-                  <FormField label="API 地址">
+                  <FormField label="API 地址" hint="主机地址或以 /v1 结尾均可">
                     <Input v-model="connectionForm.base_url" size="md" block :disabled="editingConnection?.readonly" placeholder="https://api.klong.lat" />
                   </FormField>
                   <FormField label="API Key">
@@ -1361,7 +1361,7 @@
           <span class="model-picker-icon"><Icon icon="lucide:panels-top-left" /></span>
           <span>
             <h2 id="size-picker-title">选择画面尺寸</h2>
-            <small>比例与清晰度会转换为实际像素</small>
+            <small>{{ isGeminiModel ? '按 Gemini 原生参数发送，像素仅供参考' : '比例与清晰度会转换为实际像素' }}</small>
           </span>
           <Button size="sm" variant="ghost" icon-only root-class="model-picker-close" title="关闭" @click="closeSizePicker">
             <Icon icon="lucide:x" />
@@ -1470,11 +1470,13 @@ import {
   IMAGE_RESOLUTIONS,
   IMAGE_SIZE_PRESETS,
   constrainImageSizeValue,
+  geminiImageSizePixels,
   imageSizeLabel,
   imageSizePreset,
   type ImageRatio,
   type ImageResolution,
 } from './imageSizes'
+import { imageModelProtocol, isExactImageModel, isNanoBananaModel, modelQualityOptions, normalizeNanoBananaSize } from './imageModels'
 import { createStudioRuntime, type RuntimeMode, type StudioRuntime } from './studioRuntime'
 
 // nanocat-ui 0.1.x accepts these runtime variants/emit shapes but its declarations are narrower.
@@ -1656,7 +1658,18 @@ const elapsed = ref(0)
 const toasts = ref<ToastItem[]>([])
 const confirmation = ref<ConfirmationState | null>(null)
 const deletingHistoryIds = reactive(new Set<string>())
-const form = reactive<any>({ prompt: '', connection_id: '', model: '', size: '', quality: 'medium', filename: 'generated', count: 1, concurrency: 1 })
+const form = reactive<any>({
+  prompt: '',
+  connection_id: '',
+  model: '',
+  size: '',
+  aspect_ratio: '',
+  image_size: '',
+  quality: 'medium',
+  filename: 'generated',
+  count: 1,
+  concurrency: 1,
+})
 const settingsStatus = reactive<any>({
   active_connection_id: '',
   active_connection: null,
@@ -1824,20 +1837,26 @@ const filteredModelPickerModels = computed(() => {
     ? modelPickerModels.value.filter((model) => model.toLocaleLowerCase().includes(keyword))
     : modelPickerModels.value
 })
-const serialModel = computed(() => ['gpt-image-2-vip'].includes(form.model))
-const isGemini = computed(() => String(form.model).startsWith('gemini-'))
-const isHighQualityModel = computed(() => form.model === 'gpt-image-2-high')
-const qualityOptions: SelectOption[] = [
-  { label: 'Medium', value: 'medium' },
-  { label: 'High', value: 'high' },
-]
-const selectedSizeLabel = computed(() => imageSizeLabel(form.size || 'auto'))
+const qualityOptions = computed<SelectOption[]>(() => modelQualityOptions(form.model).map((quality) => ({
+  label: quality === 'xhigh' ? 'XHigh' : `${quality.charAt(0).toUpperCase()}${quality.slice(1)}`,
+  value: quality,
+})))
+const isGeminiModel = computed(() => imageModelProtocol(form.model) === 'gemini')
+const selectedSizeLabel = computed(() => modelAwareImageSizeLabel(
+  form.size || 'auto',
+  form.aspect_ratio,
+  form.image_size,
+))
 const sizePickerSelection = computed(() => (
   IMAGE_SIZE_PRESETS.find((preset) => (
     preset.ratio === sizePickerRatio.value && preset.resolution === sizePickerResolution.value
   )) || IMAGE_SIZE_PRESETS[0]
 ))
-const sizePickerSelectionLabel = computed(() => imageSizeLabel(sizePickerSelection.value.value))
+const sizePickerSelectionLabel = computed(() => modelAwareImageSizeLabel(
+  sizePickerSelection.value.value,
+  sizePickerRatio.value,
+  sizePickerResolution.value,
+))
 const jobPercent = computed(() => {
   if (!job.value) return 0
   if (job.value.status === 'completed') return 100
@@ -2079,13 +2098,15 @@ function applySelectedModel() {
 }
 
 function openSizePicker() {
-  if (isGemini.value) return
-  const currentSelectionValue = sizePickerSelection.value.value === 'auto' ? '' : sizePickerSelection.value.value
-  if (currentSelectionValue !== form.size) {
-    const current = imageSizePreset(form.size || 'auto')
-    sizePickerRatio.value = current.ratio
-    sizePickerResolution.value = current.resolution
-  }
+  const savedRatio = IMAGE_RATIOS.includes(form.aspect_ratio as ImageRatio)
+    ? form.aspect_ratio as ImageRatio
+    : 'auto'
+  const savedResolution = IMAGE_RESOLUTIONS.includes(form.image_size as ImageResolution)
+    ? form.image_size as ImageResolution
+    : 'auto'
+  const fallback = imageSizePreset(form.size || 'auto')
+  sizePickerRatio.value = savedRatio !== 'auto' ? savedRatio : fallback.ratio
+  sizePickerResolution.value = savedResolution !== 'auto' ? savedResolution : fallback.resolution
   sizePickerOpen.value = true
 }
 
@@ -2105,9 +2126,38 @@ function sizeResolutionPixels(resolution: ImageResolution) {
   ))
   const fallback = IMAGE_SIZE_PRESETS.find((preset) => preset.resolution === resolution)
   const selectedPreset = exact || fallback
+  if (isGeminiModel.value && selectedPreset) {
+    const pixels = geminiImageSizePixels(selectedPreset.ratio, selectedPreset.resolution)
+    return pixels ? `${pixels} · 参考` : '当前比例不可用'
+  }
   return selectedPreset?.width && selectedPreset?.height
     ? `${selectedPreset.width}x${selectedPreset.height}${selectedPreset.limited ? ' · 接口上限' : ''}`
     : '当前比例不可用'
+}
+
+function modelAwareImageSizeLabel(
+  value: string,
+  aspectRatio: ImageRatio | string = '',
+  imageSize: ImageResolution | string = '',
+) {
+  const fallback = imageSizePreset(value)
+  const ratio = IMAGE_RATIOS.includes(aspectRatio as ImageRatio)
+    ? aspectRatio as ImageRatio
+    : fallback.ratio
+  const resolution = IMAGE_RESOLUTIONS.includes(imageSize as ImageResolution)
+    ? imageSize as ImageResolution
+    : fallback.resolution
+  if (ratio === 'auto' || resolution === 'auto') return imageSizeLabel(value)
+  if (!isGeminiModel.value) {
+    const selected = IMAGE_SIZE_PRESETS.find((preset) => (
+      preset.ratio === ratio && preset.resolution === resolution && preset.value === value
+    ))
+    return selected
+      ? `${selected.ratio} · ${selected.resolution} · ${selected.width}x${selected.height}${selected.limited ? ' · 接口上限' : ''}`
+      : imageSizeLabel(value)
+  }
+  const pixels = geminiImageSizePixels(ratio, resolution)
+  return `${ratio} · ${resolution}${pixels ? ` · 参考 ${pixels}` : ''}`
 }
 
 function selectSizeRatio(ratio: ImageRatio) {
@@ -2131,7 +2181,10 @@ function selectSizeResolution(resolution: ImageResolution) {
 }
 
 function applySelectedSize() {
-  form.size = sizePickerSelection.value.value === 'auto' ? '' : sizePickerSelection.value.value
+  const selectedSize = sizePickerSelection.value
+  form.size = selectedSize.value === 'auto' ? '' : selectedSize.value
+  form.aspect_ratio = selectedSize.ratio === 'auto' ? '' : selectedSize.ratio
+  form.image_size = selectedSize.resolution === 'auto' ? '' : selectedSize.resolution
   closeSizePicker()
 }
 
@@ -2186,11 +2239,11 @@ async function testConnection() {
     })
     testedModels.value = Array.from(new Set((result.models || []).map(String).filter(Boolean)))
     if (!testedModels.value.length) {
-      showToast('warning', '连接成功，但 /v1/models 没有返回可选模型')
+      showToast('warning', '连接成功，但 /v1/models 没有返回可用的图片模型')
       return
     }
     if (!testedModels.value.includes(connectionForm.default_model)) connectionForm.default_model = ''
-    showToast('success', `连接成功，发现 ${testedModels.value.length} 个模型`)
+    showToast('success', `连接成功，发现 ${testedModels.value.length} 个图片模型`)
     openModelPicker()
   } catch (error: any) {
     showToast('error', error.message)
@@ -2752,11 +2805,9 @@ function cleanFilename(value: string) {
 }
 
 function normalizeModel() {
-  if (isGemini.value) {
-    form.size = ''
-    closeSizePicker()
-  }
-  form.concurrency = serialModel.value ? 1 : Math.max(1, Number(form.count) || 1)
+  const qualities = modelQualityOptions(form.model)
+  if (qualities.length && !qualities.includes(form.quality)) form.quality = qualities.includes('medium') ? 'medium' : qualities[0]
+  form.concurrency = Math.max(1, Number(form.count) || 1)
 }
 
 function clearInputFile() {
@@ -2800,10 +2851,13 @@ async function createJob() {
     const count = Math.max(1, Number(form.count) || 1)
     const concurrency = Math.max(1, Number(form.concurrency) || 1)
     if (concurrency > count) throw new Error('并发数不能超过生成数量')
-    if (form.model !== 'gpt-image-2-exact') form.size = constrainImageSizeValue(form.size)
+    if (isNanoBananaModel(form.model)) form.size = normalizeNanoBananaSize(form.size)
+    else if (!isExactImageModel(form.model)) form.size = constrainImageSizeValue(form.size)
     const payload = {
       ...form,
-      quality: isHighQualityModel.value ? form.quality : '',
+      aspect_ratio: isGeminiModel.value ? form.aspect_ratio : '',
+      image_size: isGeminiModel.value ? form.image_size : '',
+      quality: qualityOptions.value.length ? form.quality : '',
       connection_id: generationConnection.value.id,
       continue_job_id: job.value?.id || '',
       count,
@@ -2909,6 +2963,8 @@ async function restoreHistoryJob(item: JobSummary) {
     form.prompt = restored.prompt || ''
     form.model = restored.model || form.model
     form.size = restored.size || ''
+    form.aspect_ratio = restored.aspect_ratio || ''
+    form.image_size = restored.image_size || ''
     form.filename = restored.name || 'generated'
     form.count = Math.max(1, Number(restored.count) || 1)
     await nextTick()

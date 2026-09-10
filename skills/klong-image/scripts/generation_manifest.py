@@ -79,6 +79,8 @@ def build_generation_manifest(
         "protocol": clean(result.get("protocol") or payload.get("protocol")),
         "mode": clean(result.get("mode") or payload.get("mode")),
         "size": clean(payload.get("size")),
+        "aspect_ratio": clean(payload.get("aspect_ratio") or job.get("aspect_ratio")),
+        "image_size": clean(payload.get("image_size") or job.get("image_size")).upper(),
         "count": int(job.get("count", 1) or 1),
         "requested": int(result.get("requested", job.get("count", 1)) or 1),
         "concurrency": int(job.get("concurrency", 1) or 1),

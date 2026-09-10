@@ -9,7 +9,7 @@
 - 在 Codex 对话中直接生成图片
 - 使用已有图片生成修改版本或多个变体
 - 自动选择 OpenAI 或 Gemini 请求协议
-- 通过 `/v1/models` 查询当前 Key 可用的模型
+- 通过 `/v1/models` 查询当前 Key 可用的图片模型，并按模型族自动选择协议
 - 单次生成 1-100 张图片
 - 并发数由用户按任务和账户能力设置
 - 默认不自动重试付费请求；需要时可显式开启指数退避重试
@@ -36,7 +36,7 @@
 
 工作台每 12 小时至多检查一次 GitHub 版本标签。发现新版后，顶部会显示“更新”入口；“指南 → 更新 Skill”中可以重新检查、查看对应标签或复制给 Codex 的安全更新指令。工作台只负责提醒，不会自行覆盖正在使用的 Skill，也不会触碰连接设置、API Key 或图库文件。
 
-点击右上角的设置按钮可以切换“连接”和“存储”。连接设置支持填写 API 地址和 API Key，并通过 `/v1/models` 测试连接、更新模型列表。Windows 会使用当前用户的 DPAPI 加密保存 Key，网页与 Codex 直调会读取同一份 `~/.klong-image/settings.json`，并严格使用其中当前选中的连接；其他系统只在本次工作台进程中保留网页填写的 Key，跨进程调用仍建议使用环境变量。已保存的 Key 不会返回给网页。
+点击右上角的设置按钮可以切换“连接”和“存储”。连接设置支持填写 API 地址和 API Key，并通过 `/v1/models` 测试连接、更新图片模型列表。API 地址既可填 `https://api.klong.lat`，也可填 SDK 使用的 `https://api.klong.lat/v1`；程序会自动标准化，避免拼成重复的 `/v1/v1`。Windows 会使用当前用户的 DPAPI 加密保存 Key，网页与 Codex 直调会读取同一份 `~/.klong-image/settings.json`，并严格使用其中当前选中的连接；其他系统只在本次工作台进程中保留网页填写的 Key，跨进程调用仍建议使用环境变量。已保存的 Key 不会返回给网页。
 
 网页和 Codex 直接生成的图片及任务记录共用同一个目录：默认保存在启动目录的 `outputs/prompt-studio` 下，任务元数据写入其中的 `.klong/jobs`。可在“设置 → 存储”中选择、打开或恢复图库位置；新位置会持久化到当前用户的 `~/.klong-image/settings.json`，Codex 后续直接生成也会自动使用。切换位置不会移动旧作品。`KLONG_OUTPUT_DIR` 可以锁定目录，网页单次启动也可用 `--output-dir` 覆盖；优先级为 `--output-dir`、`KLONG_OUTPUT_DIR`、网页保存位置、默认位置。
 
@@ -136,29 +136,29 @@ export KLONG_API_KEY="sk-替换成你的密钥"
 使用 $klong-image，以 assets/source.png 为输入，保持主体不变，把背景改成雪山，保存到 outputs/prompt-studio/edited.png。
 ```
 
-图生图支持 PNG、JPEG 和 WebP，输入文件最大 20 MiB。OpenAI 兼容模型使用 `/v1/images/edits`，Gemini 模型会把图片作为 `inlineData` 与提示词一起发送。
+图生图支持 PNG、JPEG 和 WebP，输入文件最大 20 MiB。GPT Image 与 Nano Banana 使用 `/v1/images/edits`；Gemini 模型通过 `/v1beta/models/{model}:generateContent` 把图片作为 `inlineData` 与提示词一起发送。
 
 ## 模型与协议
 
-| 模型 | 协议 | 并发建议 |
+| 模型 | 协议 | 说明 |
 | --- | --- | --- |
-| `gpt-image-2` | OpenAI Images | 默认模型，仅支持 1K，可按需并发 |
-| `gpt-image-2-exact` | OpenAI Images | 精确像素尺寸，最高 4K，可按需并发 |
-| `gpt-image-2-high` | OpenAI Images | 支持 1K / 2K / 4K，可选 `medium` / `high` 质量 |
-| `gpt-image-2-c` | OpenAI Images | 可按需并发 |
-| `gpt-image-2-vip` | OpenAI Images | 固定并发 1 |
-| `gemini-3-pro-image-preview` | Gemini `generateContent` | 从低并发开始 |
-| `gemini-3-pro-image-preview-c` | Gemini `generateContent` | 企业级原生路由，支持 4K 与并发 |
+| `gpt-image-2` / `gpt-image-2.5` | OpenAI Images | GPT-Image 标准能力；前者是默认模型 |
+| `gpt-image-2.5-flare` | OpenAI Images | GPT-Image 渠道中为同能力别名；官方渠道中速度优先 |
+| `gpt-image-2.5-sunburst` | OpenAI Images | GPT-Image 渠道中为同能力别名；官方渠道中精度优先 |
+| `gpt-image-2-exact` / `gpt-image-2.5-exact` | OpenAI Images | 精确像素尺寸，最高 4K |
+| `gpt-image-2-high` | OpenAI Images | 原生最高 4K，可选 `medium` / `high` 质量 |
+| `gpt-image-2-vip` | OpenAI Images | 原生最高 4K，质量固定为 `medium` |
+| `nano-banana2` / `nano-banana-pro` | OpenAI Images | NewAPI Images 路由，不走 Gemini 原生协议 |
 | `gemini-3.1-flash-image-preview` | Gemini `generateContent` | Gemini 默认选择 |
-| `gemini-3.1-flash-image-preview-c` | Gemini `generateContent` | 企业级原生路由，支持 4K 与并发 |
+| `gemini-3-pro-image-preview` | Gemini `generateContent` | Gemini Pro 图片模型 |
 
-上表是当前 Skill 的 9 模型白名单。未知模型和 `gpt-image-2-codex` 会被拒绝。五个 GPT 模型固定使用 OpenAI Images 协议，四个 Gemini 模型固定使用 Gemini 原生协议。
+模型同步不再依赖固定白名单：程序会从 `/v1/models` 的实时响应中保留 `gpt-image-*`、`nano-banana*` 和 Gemini 图片模型，过滤对话模型，并按模型族路由协议。`gpt-image-2-codex` 仍不会被当作 Images 模型。
 
-`gpt-image-2-exact` 会严格按 `--size WIDTHxHEIGHT` 输出；宽高必须分别在 64-4096 之间，总像素不超过 `4096x4096`。`gpt-image-2-high` 可用 `--quality medium` 或 `--quality high`，其他模型不接受可配置的 `quality`。
+两个 `-exact` 模型会严格按 `--size WIDTHxHEIGHT` 输出；宽高必须分别在 64-4096 之间，总像素不超过 `4096x4096`。`gpt-image-2-high` 可用 `medium` / `high`；官方 Flare 与 Sunburst 渠道可用 `low` / `medium` / `high` / `xhigh` / `max`。同名 Flare / Sunburst 的实际能力取决于控制台分配的渠道。
 
-Gemini 使用 `--aspect-ratio` 与 `--image-size 1K|2K|4K`。普通 Gemini 会把尺寸同时写入 `generationConfig.imageConfig` 和兼容字段 `responseFormat.image`；企业级 `-c` 模型只发送原生 `imageConfig`。自动比例应省略 `--aspect-ratio`，不要传 `auto`。
+Gemini 使用 `--aspect-ratio` 与 `--image-size 1K|2K|4K`，尺寸只写入 `generationConfig.imageConfig`。程序按当前文档优先读取 `file_data.file_uri` / `fileData.fileUri`，其次读取 Markdown 图片链接，并兼容 `inlineData` Base64；不会再发送 `responseFormat`。自动比例应省略 `--aspect-ratio`，不要传 `auto`。
 
-查看当前 Key 可用的全部模型：
+查看当前 Key 可用、且能由此 Skill 路由的图片模型：
 
 ```powershell
 python .\skills\klong-image\scripts\generate.py --list-models
@@ -182,7 +182,7 @@ python .\skills\klong-image\scripts\generate.py `
 
 ```powershell
 python .\skills\klong-image\scripts\generate.py `
-  --model gpt-image-2-c `
+  --model gpt-image-2.5 `
   --input-image assets\source.png `
   --prompt "保持主体不变，把背景改成雪山" `
   --output outputs\prompt-studio\edited.png
@@ -198,8 +198,8 @@ python .\skills\klong-image\scripts\generate.py `
 | `--name` | 输出文件名 | 网页历史中显示的任务名称 |
 | `--gallery-dir` | 共享输出目录 | 写入网页任务历史和图库元数据的根目录 |
 | `--input-image` | 无 | 图生图源文件，支持 PNG、JPEG、WebP，最大 20 MiB |
-| `--size` | 自动 | GPT 像素尺寸，如 `1024x1024`；`gpt-image-2-exact` 会严格输出该尺寸 |
-| `--quality` | 无 | 仅 `gpt-image-2-high` 支持：`medium` 或 `high` |
+| `--size` | 自动 | OpenAI Images 尺寸；GPT 使用像素，Nano Banana 还接受比例或 `1K` / `2K` / `4K` |
+| `--quality` | 无 | High 支持 `medium/high`；官方 Flare / Sunburst 支持 `low` 至 `max` |
 | `--aspect-ratio` | 自动 | Gemini 原生比例，如 `1:1`、`3:4`、`16:9`；自动比例时省略 |
 | `--image-size` | 自动 | Gemini 原生分辨率：`1K`、`2K` 或 `4K`，K 必须大写 |
 | `--count` | `1` | 生成数量，范围 1-100 |
@@ -208,7 +208,7 @@ python .\skills\klong-image\scripts\generate.py `
 | `--retries` | `0` | 临时错误重试次数，范围 0-5；默认关闭以避免重复计费 |
 | `--retry-delay` | `3` | 首次重试等待秒数，范围 0-60 |
 | `--check` | 关闭 | 只检查指定模型是否可用 |
-| `--list-models` | 关闭 | 列出当前 Key 可见的模型 |
+| `--list-models` | 关闭 | 列出当前 Key 可见且可识别的图片模型 |
 | `--no-progress` | 关闭 | 关闭 stderr 中的人类可读实时状态 |
 | `--no-history` | 关闭 | 不写入网页任务历史元数据 |
 
@@ -217,7 +217,7 @@ python .\skills\klong-image\scripts\generate.py `
 生成过程中，脚本会在 stderr 实时输出请求开始、重试、完成和失败状态。超过 30 秒的任务会定期显示真实等待时间：
 
 ```text
-[start] model=gpt-image-2-vip protocol=openai mode=text-to-image requests=4 concurrency=1 timeout=600s
+[start] model=gpt-image-2.5 protocol=openai mode=text-to-image requests=4 concurrency=2 timeout=600s
 [request 1/4] started
 [waiting] elapsed=30.0s active=1 completed=0/4 succeeded=0 failed=0
 [request 1/4] completed duration=91.2s size=14.40MiB dimensions=3840x2160

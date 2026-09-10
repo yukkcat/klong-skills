@@ -1,6 +1,21 @@
 import { openDB, type IDBPDatabase } from 'idb'
 import JSZip from 'jszip'
-import { constrainImageSizeValue, imageSizePreset } from './imageSizes'
+import {
+  imageModelIds,
+  imageModelProtocol,
+  isExactImageModel,
+  isNanoBananaModel,
+  modelQualityOptions,
+  normalizeNanoBananaSize,
+} from './imageModels'
+import {
+  IMAGE_RATIOS,
+  IMAGE_RESOLUTIONS,
+  constrainImageSizeValue,
+  imageSizePreset,
+  type ImageRatio,
+  type ImageResolution,
+} from './imageSizes'
 
 export type RuntimeMode = 'local' | 'browser'
 
@@ -71,9 +86,6 @@ const DB_NAME = 'klong-prompt-studio'
 const DB_VERSION = 1
 const DEFAULT_BASE_URL = 'https://api.klong.lat'
 const DEFAULT_MODEL = 'gpt-image-2'
-const SERIAL_MODELS = new Set(['gpt-image-2-vip'])
-const GEMINI_MODELS = new Set(['gemini-3-pro-image-preview', 'gemini-3-pro-image-preview-c', 'gemini-3.1-flash-image-preview', 'gemini-3.1-flash-image-preview-c'])
-const SUPPORTED_MODELS = new Set(['gpt-image-2', 'gpt-image-2-exact', 'gpt-image-2-high', 'gpt-image-2-c', 'gpt-image-2-vip', ...GEMINI_MODELS])
 const PROMPT_REGISTRY_BASE = 'https://raw.githubusercontent.com/yukkcat/image-prompts/main/dist'
 const PROMPT_REGISTRY_MANIFEST_MAX_BYTES = 128 * 1024
 const PROMPT_REGISTRY_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
@@ -104,6 +116,23 @@ function randomId() {
 
 function plainRecord(value: unknown): value is Record<string, any> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function normalizeGeminiImageConfig(payload: Record<string, any>, size: string) {
+  let aspectRatio = String(payload.aspect_ratio || '').trim()
+  let imageSize = String(payload.image_size || '').trim().toUpperCase()
+  if (aspectRatio.toLowerCase() === 'auto') aspectRatio = ''
+  if (imageSize.toLowerCase() === 'auto') imageSize = ''
+  if (aspectRatio && !IMAGE_RATIOS.slice(1).includes(aspectRatio as ImageRatio)) {
+    throw new Error(`Gemini 不支持 aspect_ratio=${aspectRatio}`)
+  }
+  if (imageSize && !IMAGE_RESOLUTIONS.slice(1).includes(imageSize as ImageResolution)) {
+    throw new Error(`Gemini 不支持 image_size=${imageSize}`)
+  }
+  const fallback = imageSizePreset(size)
+  if (!aspectRatio && fallback.ratio !== 'auto') aspectRatio = fallback.ratio
+  if (!imageSize && fallback.resolution !== 'auto') imageSize = fallback.resolution
+  return { aspect_ratio: aspectRatio, image_size: imageSize }
 }
 
 function exactFields(value: Record<string, any>, expected: Set<string>, label: string) {
@@ -520,7 +549,12 @@ function cleanBaseUrl(value: unknown) {
   const localHttp = parsed.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)
   if (parsed.protocol !== 'https:' && !localHttp) throw new Error('API 地址必须使用 HTTPS；本机 localhost 可使用 HTTP')
   if (parsed.username || parsed.password || parsed.search || parsed.hash) throw new Error('API 地址不能包含账号、查询参数或片段')
-  return raw
+  return raw.replace(/\/v1$/i, '')
+}
+
+function apiUrl(baseUrl: unknown, path: string) {
+  if (!path.startsWith('/')) throw new Error('API endpoint path must start with /')
+  return `${cleanBaseUrl(baseUrl)}${path}`
 }
 
 async function responseError(response: Response) {
@@ -546,6 +580,52 @@ async function responseError(response: Response) {
 async function dataUrlToBlob(value: string) {
   const response = await fetch(value)
   return response.blob()
+}
+
+function httpUrl(value: unknown) {
+  const raw = String(value || '').trim()
+  try {
+    const parsed = new URL(raw)
+    return ['http:', 'https:'].includes(parsed.protocol) ? parsed.href : ''
+  } catch {
+    return ''
+  }
+}
+
+type GeminiImageReference =
+  | { kind: 'url'; url: string }
+  | { kind: 'inline'; data: string; mimeType: string }
+
+function geminiImageReference(data: any): GeminiImageReference | null {
+  const candidates = Array.isArray(data?.candidates) ? data.candidates : []
+  const parts = candidates.flatMap((candidate: any) => (
+    Array.isArray(candidate?.content?.parts) ? candidate.content.parts : []
+  ))
+
+  for (const part of parts) {
+    const file = part?.fileData || part?.file_data
+    const url = httpUrl(file?.fileUri || file?.file_uri)
+    if (url) return { kind: 'url', url }
+  }
+
+  const markdownImage = /!\[[^\]]*\]\(\s*<?(https?:\/\/[^)\s>]+)>?\s*\)/i
+  for (const part of parts) {
+    const match = typeof part?.text === 'string' ? part.text.match(markdownImage) : null
+    const url = httpUrl(match?.[1])
+    if (url) return { kind: 'url', url }
+  }
+
+  for (const part of parts) {
+    const inline = part?.inlineData || part?.inline_data
+    if (inline?.data) {
+      return {
+        kind: 'inline',
+        data: String(inline.data),
+        mimeType: String(inline.mimeType || inline.mime_type || 'image/png'),
+      }
+    }
+  }
+  return null
 }
 
 function imageMimeFromBytes(bytes: Uint8Array, fallback = '') {
@@ -828,15 +908,15 @@ class BrowserRuntime implements StudioRuntime {
   }
 
   private async fetchModels(baseUrl: string, apiKey: string) {
-    const response = await fetch(`${cleanBaseUrl(baseUrl)}/v1/models`, {
+    const response = await fetch(apiUrl(baseUrl, '/v1/models'), {
       headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' },
       credentials: 'omit',
     })
     if (!response.ok) throw await responseError(response)
     const data = await response.json()
-    const raw = Array.isArray(data) ? data : Array.isArray(data.data) ? data.data : []
-    const models = raw.map((item: any) => typeof item === 'string' ? item : item?.id).filter(Boolean).map(String)
-    return [...new Set<string>(models)].filter((model) => SUPPORTED_MODELS.has(model))
+    const raw = Array.isArray(data) ? data : Array.isArray(data?.data) ? data.data : Array.isArray(data?.models) ? data.models : null
+    if (!raw) throw new Error('模型接口响应中没有模型数组')
+    return imageModelIds(raw)
   }
 
   private async testConnection(payload: Record<string, any>) {
@@ -1102,13 +1182,20 @@ class BrowserRuntime implements StudioRuntime {
       throw new Error('生成数量必须为 1-100，并发数必须在 1 和生成数量之间')
     }
     const model = String(payload.model || DEFAULT_MODEL).trim()
-    if (!SUPPORTED_MODELS.has(model)) throw new Error(`${model} 不是此 Skill 支持的模型`)
-    if (payload.quality && model !== 'gpt-image-2-high') throw new Error('只有 gpt-image-2-high 可设置 quality')
-    if (SERIAL_MODELS.has(model) && concurrency !== 1) throw new Error(`${model} 仅支持并发数 1`)
-    const size = model === 'gpt-image-2-exact' || model.startsWith('gemini-')
-      ? String(payload.size || '')
-      : constrainImageSizeValue(String(payload.size || ''))
-    const normalizedPayload = { ...payload, size }
+    const modelProtocol = imageModelProtocol(model)
+    if (!modelProtocol) throw new Error(`${model} 不是此 Skill 可识别的图片模型`)
+    const quality = String(payload.quality || '')
+    if (quality && !modelQualityOptions(model).includes(quality as any)) throw new Error(`${model} 不支持 quality=${quality}`)
+    const requestedSize = String(payload.size || '')
+    const size = isExactImageModel(model) || modelProtocol === 'gemini'
+      ? requestedSize
+      : isNanoBananaModel(model)
+        ? normalizeNanoBananaSize(requestedSize)
+        : constrainImageSizeValue(requestedSize)
+    const geminiImageConfig = modelProtocol === 'gemini'
+      ? normalizeGeminiImageConfig(payload, size)
+      : { aspect_ratio: '', image_size: '' }
+    const normalizedPayload = { ...payload, size, ...geminiImageConfig }
     const { connection } = await this.resolveConnection(payload.connection_id)
     const continueJobId = String(payload.continue_job_id || '').trim()
     if (continueJobId && !/^[A-Za-z0-9_-]{1,80}$/.test(continueJobId)) throw new Error('任务 ID 无效')
@@ -1129,6 +1216,7 @@ class BrowserRuntime implements StudioRuntime {
       prompt,
       model,
       size,
+      ...geminiImageConfig,
       mode: payload.input_image ? 'image-to-image' : 'text-to-image',
       protocol: String(payload.protocol || ''),
       connection_id: connection.id,
@@ -1151,6 +1239,7 @@ class BrowserRuntime implements StudioRuntime {
       protocol: String(payload.protocol || ''),
       mode: batch.mode,
       size,
+      ...geminiImageConfig,
       count,
       concurrency,
       progress: [],
@@ -1262,7 +1351,7 @@ class BrowserRuntime implements StudioRuntime {
 
   private batchResult(job: Record<string, any>, images: Array<Record<string, any>>, failures: Array<Record<string, any>>, started: number) {
     return {
-      protocol: job.model.startsWith('gemini-') ? 'gemini' : 'openai',
+      protocol: imageModelProtocol(job.model) || '',
       mode: job.mode,
       model: job.model,
       requested: job.count,
@@ -1295,12 +1384,13 @@ class BrowserRuntime implements StudioRuntime {
 
   private async generateOne(job: Record<string, any>, payload: Record<string, any>) {
     const { connection, apiKey } = await this.resolveConnection(job.connection_id)
+    const expectedProtocol = imageModelProtocol(job.model)
+    if (!expectedProtocol) throw new Error(`${job.model} 不是此 Skill 可识别的图片模型`)
+    const protocol = String(payload.protocol || expectedProtocol)
+    if (protocol !== expectedProtocol) throw new Error(`${job.model} 必须使用 ${expectedProtocol} 协议`)
     const controller = new AbortController()
     const timeoutSeconds = 600
     const timeout = window.setTimeout(() => controller.abort(), timeoutSeconds * 1000)
-    const expectedProtocol = GEMINI_MODELS.has(job.model) ? 'gemini' : 'openai'
-    const protocol = String(payload.protocol || expectedProtocol)
-    if (protocol !== expectedProtocol) throw new Error(`${job.model} 必须使用 ${expectedProtocol} 协议`)
     try {
       if (protocol === 'gemini') {
         const parts: Array<Record<string, any>> = [{ text: job.prompt }]
@@ -1308,16 +1398,13 @@ class BrowserRuntime implements StudioRuntime {
           const [header, data] = String(payload.input_image).split(',', 2)
           parts.push({ inlineData: { mimeType: header.match(/^data:([^;]+)/)?.[1] || 'image/png', data } })
         }
-        const preset = imageSizePreset(String(job.size || ''))
+        const imageSettings = normalizeGeminiImageConfig(job, String(job.size || ''))
         const imageConfig: Record<string, string> = {}
-        if (preset.ratio !== 'auto') imageConfig.aspectRatio = preset.ratio
-        if (preset.resolution !== 'auto') imageConfig.imageSize = preset.resolution
+        if (imageSettings.aspect_ratio) imageConfig.aspectRatio = imageSettings.aspect_ratio
+        if (imageSettings.image_size) imageConfig.imageSize = imageSettings.image_size
         const generationConfig: Record<string, any> = { responseModalities: ['IMAGE'] }
         if (Object.keys(imageConfig).length) generationConfig.imageConfig = imageConfig
-        if (!job.model.endsWith('-c') && Object.keys(imageConfig).length) {
-          generationConfig.responseFormat = { image: { ...imageConfig } }
-        }
-        const response = await fetch(`${connection.base_url}/v1beta/models/${encodeURIComponent(job.model)}:generateContent`, {
+        const response = await fetch(apiUrl(connection.base_url, `/v1beta/models/${encodeURIComponent(job.model)}:generateContent`), {
           method: 'POST',
           headers: { 'x-goog-api-key': apiKey, 'Content-Type': 'application/json' },
           body: JSON.stringify({ contents: [{ role: 'user', parts }], generationConfig }),
@@ -1326,10 +1413,14 @@ class BrowserRuntime implements StudioRuntime {
         })
         if (!response.ok) throw await this.generationError(response)
         const data = await response.json()
-        const responseParts = data.candidates?.[0]?.content?.parts || []
-        const inline = responseParts.map((part: any) => part.inlineData || part.inline_data).find((part: any) => part?.data)
-        if (!inline) throw new Error('Gemini 响应中没有图片数据')
-        return { blob: blobFromBase64(inline.data, inline.mimeType || inline.mime_type || 'image/png'), protocol: 'gemini' }
+        const image = geminiImageReference(data)
+        if (image?.kind === 'inline') return { blob: blobFromBase64(image.data, image.mimeType), protocol: 'gemini' }
+        if (image?.kind === 'url') {
+          const imageResponse = await fetch(image.url, { credentials: 'omit', signal: controller.signal })
+          if (!imageResponse.ok) throw await this.generationError(imageResponse)
+          return { blob: await imageResponse.blob(), protocol: 'gemini' }
+        }
+        throw new Error('Gemini 响应中没有文件地址、Markdown 图片地址或内联图片数据')
       }
 
       let response: Response
@@ -1342,11 +1433,11 @@ class BrowserRuntime implements StudioRuntime {
         if (job.size) body.set('size', job.size)
         if (payload.quality) body.set('quality', String(payload.quality))
         body.set('image', image, `reference.${image.type.includes('webp') ? 'webp' : image.type.includes('png') ? 'png' : 'jpg'}`)
-        response = await fetch(`${connection.base_url}/v1/images/edits`, {
+        response = await fetch(apiUrl(connection.base_url, '/v1/images/edits'), {
           method: 'POST', headers: { Authorization: `Bearer ${apiKey}` }, body, credentials: 'omit', signal: controller.signal,
         })
       } else {
-        response = await fetch(`${connection.base_url}/v1/images/generations`, {
+        response = await fetch(apiUrl(connection.base_url, '/v1/images/generations'), {
           method: 'POST',
           headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
           body: JSON.stringify({ model: job.model, prompt: job.prompt, n: 1, ...(job.size ? { size: job.size } : {}), ...(payload.quality ? { quality: payload.quality } : {}) }),
@@ -1356,14 +1447,19 @@ class BrowserRuntime implements StudioRuntime {
       }
       if (!response.ok) throw await this.generationError(response)
       const data = await response.json()
-      const item = data.data?.[0]
-      if (item?.b64_json) return { blob: blobFromBase64(item.b64_json), protocol: 'openai' }
-      if (item?.url) {
-        const imageResponse = await fetch(item.url, { credentials: 'omit', signal: controller.signal })
+      const items = Array.isArray(data?.data) ? data.data : []
+      const item = items[0]
+      if (!item || typeof item !== 'object') throw new Error('接口响应中没有 data[0] 图片对象')
+      if (typeof item.b64_json === 'string' && item.b64_json) {
+        return { blob: blobFromBase64(item.b64_json), protocol: 'openai' }
+      }
+      const imageUrl = httpUrl(item.url)
+      if (imageUrl) {
+        const imageResponse = await fetch(imageUrl, { credentials: 'omit', signal: controller.signal })
         if (!imageResponse.ok) throw await this.generationError(imageResponse)
         return { blob: await imageResponse.blob(), protocol: 'openai' }
       }
-      throw new Error('接口响应中没有图片数据')
+      throw new Error('接口响应中没有可用的 Base64 图片或 HTTP(S) 图片地址')
     } catch (error: any) {
       if (error?.name === 'AbortError' || error instanceof TypeError) error.transient = true
       throw error

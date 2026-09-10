@@ -150,6 +150,10 @@ def validate_base_url(value: object) -> str:
         raise ValueError("API 地址必须使用 HTTPS；本机 localhost 可使用 HTTP")
     if parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise ValueError("API 地址不能包含账号、查询参数或片段")
+    # Klong documents both the service root and the OpenAI SDK base URL. Store
+    # one canonical service root so callers can safely append /v1 or /v1beta.
+    if parsed.path.rstrip("/").lower().endswith("/v1"):
+        url = url[:-3].rstrip("/")
     return url
 
 

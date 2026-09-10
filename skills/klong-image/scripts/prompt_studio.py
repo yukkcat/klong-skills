@@ -48,13 +48,18 @@ from image_sizes import constrain_image_size
 
 GEMINI_BASE_SIZES = {
     "1:1": (1024, 1024), "2:3": (1024, 1536), "3:2": (1536, 1024),
-    "3:4": (1024, 1365), "4:3": (1365, 1024), "9:16": (1080, 1920), "16:9": (1920, 1080),
+    "3:4": (1024, 1365), "4:3": (1365, 1024), "5:4": (1152, 928), "4:5": (928, 1152),
+    "9:16": (1080, 1920), "16:9": (1920, 1080), "21:9": (1584, 672),
 }
+GEMINI_RATIOS = set(GEMINI_BASE_SIZES)
+GEMINI_IMAGE_SIZES = {"1K", "2K", "4K"}
 GEMINI_SIZE_PRESETS = {}
 for _ratio, (_width, _height) in GEMINI_BASE_SIZES.items():
     for _tier, _multiplier in (("1K", 1), ("2K", 2), ("4K", 4)):
         _value, _ = constrain_image_size(f"{_width * _multiplier}x{_height * _multiplier}")
-        GEMINI_SIZE_PRESETS[_value] = (_ratio, _tier)
+        # Old manifests only stored the constrained pixel value. Some 2K and 4K
+        # presets collide at the upstream limit, so prefer the earlier/lower tier.
+        GEMINI_SIZE_PRESETS.setdefault(_value, (_ratio, _tier))
 
 
 REGISTRY_MANIFEST_MAX_BYTES = 128 * 1024
@@ -1317,9 +1322,19 @@ class Settings:
             raise ValueError("请先填写 API Key")
         environment = os.environ.copy()
         environment["KLONG_API_KEY"] = api_key
+        environment["KLONG_BASE_URL"] = base_url
         environment["PYTHONIOENCODING"] = "utf-8"
         environment["PYTHONUTF8"] = "1"
-        command = [sys.executable, str(GENERATE_SCRIPT), "--list-models", "--base-url", base_url, "--timeout", "30", "--no-progress"]
+        command = [
+            sys.executable,
+            str(GENERATE_SCRIPT),
+            "--list-models",
+            "--base-url", base_url,
+            "--connection-id", connection_id or "connection-test",
+            "--connection-name", clean(payload.get("name")) or "连接测试",
+            "--timeout", "30",
+            "--no-progress",
+        ]
         try:
             completed = subprocess.run(command, capture_output=True, text=True, encoding="utf-8", errors="replace", env=environment, timeout=35, check=False)
         except subprocess.TimeoutExpired as exc:
@@ -1639,6 +1654,8 @@ class Gallery:
             "connection_name": clean(data.get("connection_name")),
             "protocol": clean(data.get("protocol")),
             "size": clean(data.get("size")),
+            "aspect_ratio": clean(data.get("aspect_ratio")),
+            "image_size": clean(data.get("image_size")).upper(),
             "count": int(data.get("count", max(1, len(images))) or 1),
             "concurrency": int(data.get("concurrency", 1) or 1),
             "progress": [str(line) for line in data.get("progress", [])][-80:],
@@ -1722,8 +1739,6 @@ class Jobs:
         if not 1 <= count <= 100 or not 1 <= concurrency <= count:
             raise ValueError("count must be 1-100 and concurrency must be between 1 and count")
         model = clean(payload.get("model") or "gpt-image-2")
-        if model == "gpt-image-2-vip" and concurrency != 1:
-            raise ValueError(f"{model} only supports concurrency 1")
 
         continue_job_id = clean(payload.get("continue_job_id"))
         if continue_job_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", continue_job_id):
@@ -1743,9 +1758,35 @@ class Jobs:
         mode = "image-to-image" if payload.get("input_image") else "text-to-image"
         size = clean(payload.get("size"))
         requested_protocol = clean(payload.get("protocol"))
-        if size and model != "gpt-image-2-exact" and requested_protocol != "gemini" and not model.startswith("gemini-"):
+        model_family = model.lower()
+        is_gemini = requested_protocol == "gemini" or model_family.startswith("gemini-")
+        exact_model = model_family.startswith("gpt-image-") and model_family.endswith("-exact")
+        if size and not exact_model and not model_family.startswith("nano-banana") and not is_gemini:
             size, _ = constrain_image_size(size)
-        payload = {**payload, "size": size}
+        aspect_ratio = clean(payload.get("aspect_ratio"))
+        image_size = clean(payload.get("image_size")).upper()
+        if aspect_ratio.lower() == "auto":
+            aspect_ratio = ""
+        if image_size.lower() == "auto":
+            image_size = ""
+        if is_gemini:
+            if aspect_ratio and aspect_ratio not in GEMINI_RATIOS:
+                raise ValueError(f"Gemini does not support aspect_ratio={aspect_ratio}")
+            if image_size and image_size not in GEMINI_IMAGE_SIZES:
+                raise ValueError(f"Gemini does not support image_size={image_size}")
+            preset = GEMINI_SIZE_PRESETS.get(size)
+            if preset:
+                aspect_ratio = aspect_ratio or preset[0]
+                image_size = image_size or preset[1]
+        else:
+            aspect_ratio = ""
+            image_size = ""
+        payload = {
+            **payload,
+            "size": size,
+            "aspect_ratio": aspect_ratio,
+            "image_size": image_size,
+        }
         batch = {
             "id": batch_id,
             "status": "queued",
@@ -1754,6 +1795,8 @@ class Jobs:
             "prompt": prompt,
             "model": model,
             "size": size,
+            "aspect_ratio": aspect_ratio,
+            "image_size": image_size,
             "mode": mode,
             "protocol": clean(payload.get("protocol")),
             "connection_id": connection["id"],
@@ -1777,6 +1820,8 @@ class Jobs:
             "protocol": clean(payload.get("protocol")),
             "mode": mode,
             "size": size,
+            "aspect_ratio": aspect_ratio,
+            "image_size": image_size,
             "count": count,
             "concurrency": concurrency,
             "progress": [],
@@ -1824,10 +1869,13 @@ class Jobs:
         quality = clean(payload.get("quality"))
         if protocol in {"openai", "gemini"}:
             command += ["--protocol", protocol]
-        if size and (protocol == "gemini" or job["model"].startswith("gemini-")):
-            preset = GEMINI_SIZE_PRESETS.get(size)
-            if preset:
-                command += ["--aspect-ratio", preset[0], "--image-size", preset[1]]
+        if protocol == "gemini" or job["model"].lower().startswith("gemini-"):
+            aspect_ratio = clean(payload.get("aspect_ratio"))
+            image_size = clean(payload.get("image_size")).upper()
+            if aspect_ratio:
+                command += ["--aspect-ratio", aspect_ratio]
+            if image_size:
+                command += ["--image-size", image_size]
         elif size:
             command += ["--size", size]
         if quality:

@@ -1,5 +1,5 @@
 export type ImageResolution = 'auto' | '1K' | '2K' | '4K'
-export type ImageRatio = 'auto' | '1:1' | '2:3' | '3:2' | '3:4' | '4:3' | '9:16' | '16:9'
+export type ImageRatio = 'auto' | '1:1' | '2:3' | '3:2' | '3:4' | '4:3' | '5:4' | '4:5' | '9:16' | '16:9' | '21:9'
 
 export type ImageSizePreset = {
   value: string
@@ -19,8 +19,24 @@ const BASE_IMAGE_SIZES: Record<Exclude<ImageRatio, 'auto'>, readonly [number, nu
   '3:2': [1536, 1024],
   '3:4': [1024, 1365],
   '4:3': [1365, 1024],
+  '5:4': [1152, 928],
+  '4:5': [928, 1152],
   '9:16': [1080, 1920],
   '16:9': [1920, 1080],
+  '21:9': [1584, 672],
+}
+
+const GEMINI_BASE_IMAGE_SIZES: Record<Exclude<ImageRatio, 'auto'>, readonly [number, number]> = {
+  '1:1': [1024, 1024],
+  '2:3': [848, 1264],
+  '3:2': [1264, 848],
+  '3:4': [896, 1200],
+  '4:3': [1200, 896],
+  '5:4': [1152, 928],
+  '4:5': [928, 1152],
+  '9:16': [768, 1376],
+  '16:9': [1376, 768],
+  '21:9': [1584, 672],
 }
 
 const RESOLUTION_MULTIPLIERS: Record<Exclude<ImageResolution, 'auto'>, number> = {
@@ -29,7 +45,7 @@ const RESOLUTION_MULTIPLIERS: Record<Exclude<ImageResolution, 'auto'>, number> =
   '4K': 4,
 }
 
-export const IMAGE_RATIOS: ImageRatio[] = ['auto', '1:1', '2:3', '3:2', '3:4', '4:3', '9:16', '16:9']
+export const IMAGE_RATIOS: ImageRatio[] = ['auto', '1:1', '2:3', '3:2', '3:4', '4:3', '5:4', '4:5', '9:16', '16:9', '21:9']
 export const IMAGE_RESOLUTIONS: ImageResolution[] = ['auto', '1K', '2K', '4K']
 
 export function constrainImageDimensions(width: number, height: number) {
@@ -90,4 +106,11 @@ export function imageSizeLabel(value: string): string {
   const selected = IMAGE_SIZE_PRESETS.find((item) => item.value === value)
   if (!selected) return value
   return `${selected.ratio} · ${selected.resolution} · ${selected.width}x${selected.height}${selected.limited ? ' · 接口上限' : ''}`
+}
+
+export function geminiImageSizePixels(ratio: ImageRatio, resolution: ImageResolution): string {
+  if (ratio === 'auto' || resolution === 'auto') return ''
+  const [width, height] = GEMINI_BASE_IMAGE_SIZES[ratio]
+  const multiplier = RESOLUTION_MULTIPLIERS[resolution]
+  return `${width * multiplier}x${height * multiplier}`
 }
