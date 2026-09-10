@@ -32,7 +32,7 @@
 使用 $klong-image 打开本地提示词工作台。
 ```
 
-程序会打开 `http://127.0.0.1:8765`。首次启动会在后台从 [yukkcat/image-prompts](https://github.com/yukkcat/image-prompts) 的 `dist/manifest.json` 和标准化提示词快照下载全部内置提示词；后续启动直接读取本地缓存，旧版逐个来源缓存会自动迁移。当前快照包含 7 个来源（包括 Freestylefly GPT Image 2）。网页支持搜索、来源与分类筛选、文生图/图生图、批量数量、并发设置和实时生成状态。打开旧任务后可以修改提示词、模型、尺寸、连接、数量等参数继续生成；新图片会作为新批次追加到原任务，旧图片和各自的生成参数都会保留。需要完全独立的任务时再点击“新建”。
+程序会打开 `http://127.0.0.1:8765`。首次启动会在后台从 [yukkcat/image-prompts](https://github.com/yukkcat/image-prompts) 的 `dist/manifest.json` 和标准化提示词快照下载全部内置提示词；后续启动直接读取本地缓存，旧版逐个来源缓存会自动迁移。当前快照包含 7 个来源（包括 Freestylefly GPT Image 2）。网页支持搜索、来源与分类筛选、文生图/图生图、批量数量、并发设置和实时生成状态。图生图可以通过文件选择、拖拽或剪贴板粘贴一次添加最多 5 张参考图，并逐张预览或移除。打开旧任务后可以修改提示词、模型、尺寸、连接、数量等参数继续生成；新图片会作为新批次追加到原任务，旧图片和各自的生成参数都会保留。需要完全独立的任务时再点击“新建”。
 
 工作台每 12 小时至多检查一次 GitHub 版本标签。发现新版后，顶部会显示“更新”入口；“指南 → 更新 Skill”中可以重新检查、查看对应标签或复制给 Codex 的安全更新指令。工作台只负责提醒，不会自行覆盖正在使用的 Skill，也不会触碰连接设置、API Key 或图库文件。
 
@@ -136,7 +136,7 @@ export KLONG_API_KEY="sk-替换成你的密钥"
 使用 $klong-image，以 assets/source.png 为输入，保持主体不变，把背景改成雪山，保存到 outputs/prompt-studio/edited.png。
 ```
 
-图生图支持 PNG、JPEG 和 WebP，输入文件最大 20 MiB。GPT Image 与 Nano Banana 使用 `/v1/images/edits`；Gemini 模型通过 `/v1beta/models/{model}:generateContent` 把图片作为 `inlineData` 与提示词一起发送。
+图生图支持最多 5 张 PNG、JPEG 或 WebP 参考图，每张最大 20 MiB。GPT Image 与 Nano Banana 使用 `/v1/images/edits`，多张图片以重复的 `image` 字段发送；Gemini 模型通过 `/v1beta/models/{model}:generateContent` 把每张图片作为独立的 `inlineData` 与提示词一起发送。
 
 ## 模型与协议
 
@@ -184,6 +184,7 @@ python .\skills\klong-image\scripts\generate.py `
 python .\skills\klong-image\scripts\generate.py `
   --model gpt-image-2.5 `
   --input-image assets\source.png `
+  --input-image assets\style.png `
   --prompt "保持主体不变，把背景改成雪山" `
   --output outputs\prompt-studio\edited.png
 ```
@@ -197,7 +198,7 @@ python .\skills\klong-image\scripts\generate.py `
 | `--output` | 自动命名 | 默认写入 `KLONG_OUTPUT_DIR` 或 `outputs/prompt-studio`；显式路径优先 |
 | `--name` | 输出文件名 | 网页历史中显示的任务名称 |
 | `--gallery-dir` | 共享输出目录 | 写入网页任务历史和图库元数据的根目录 |
-| `--input-image` | 无 | 图生图源文件，支持 PNG、JPEG、WebP，最大 20 MiB |
+| `--input-image` | 无 | 图生图参考文件；可重复传入最多 5 次，支持 PNG、JPEG、WebP，每张最大 20 MiB |
 | `--size` | 自动 | OpenAI Images 尺寸；GPT 使用像素，Nano Banana 还接受比例或 `1K` / `2K` / `4K` |
 | `--quality` | 无 | High 支持 `medium/high`；官方 Flare / Sunburst 支持 `low` 至 `max` |
 | `--aspect-ratio` | 自动 | Gemini 原生比例，如 `1:1`、`3:4`、`16:9`；自动比例时省略 |

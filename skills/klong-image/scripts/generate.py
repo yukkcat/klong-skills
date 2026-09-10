@@ -40,6 +40,7 @@ QUALITY_OPTIONS = {
 DEFAULT_OPENAI_MODEL = "gpt-image-2"
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 MAX_INPUT_BYTES = 20 * 1024 * 1024
+MAX_INPUT_IMAGES = 5
 USER_AGENT = "klong-image-skill/0.1"
 DEFAULT_OUTPUT_DIR = Path(resolve_output_directory()["path"])
 
@@ -283,19 +284,21 @@ def image_dimensions(content: bytes) -> tuple[int | None, int | None]:
     return None, None
 
 
-def multipart_body(fields: dict[str, str], filename: str, content: bytes, mime_type: str) -> tuple[bytes, str]:
+def multipart_body(fields: dict[str, str], images: list[tuple[str, bytes, str]]) -> tuple[bytes, str]:
     boundary = f"klong-{secrets.token_hex(16)}"
     chunks = []
     for name, value in fields.items():
         chunks.append(
             f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode("utf-8")
         )
-    safe_filename = filename.replace('"', "_").replace("\r", "_").replace("\n", "_")
-    chunks.append(
-        f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="{safe_filename}"\r\n'
-        f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8")
-    )
-    chunks.extend((content, b"\r\n", f"--{boundary}--\r\n".encode("ascii")))
+    for filename, content, mime_type in images:
+        safe_filename = filename.replace('"', "_").replace("\r", "_").replace("\n", "_")
+        chunks.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="image"; filename="{safe_filename}"\r\n'
+            f"Content-Type: {mime_type}\r\n\r\n".encode("utf-8")
+        )
+        chunks.extend((content, b"\r\n"))
+    chunks.append(f"--{boundary}--\r\n".encode("ascii"))
     return b"".join(chunks), boundary
 
 
@@ -405,15 +408,19 @@ def decode_base64_image(value: object, source: str) -> bytes:
 
 
 def generate_openai(base_url: str, api_key: str, args: argparse.Namespace) -> tuple[bytes, str]:
-    if args.input_image_bytes is not None:
+    if args.input_image_bytes:
         fields = {"model": args.model, "prompt": args.prompt, "n": "1"}
         if args.size:
             fields["size"] = args.size
         if args.quality:
             fields["quality"] = args.quality
-        body, boundary = multipart_body(
-            fields, args.input_image_path.name, args.input_image_bytes, args.input_image_mime
-        )
+        images = [
+            (path.name, content, mime_type)
+            for path, content, mime_type in zip(
+                args.input_image_paths, args.input_image_bytes, args.input_image_mimes, strict=True
+            )
+        ]
+        body, boundary = multipart_body(fields, images)
         result = request_multipart(api_endpoint(base_url, "/v1/images/edits"), api_key, body, boundary, args.timeout)
     else:
         payload = {"model": args.model, "prompt": args.prompt, "n": 1}
@@ -445,11 +452,11 @@ def generate_openai(base_url: str, api_key: str, args: argparse.Namespace) -> tu
 
 def generate_gemini(base_url: str, api_key: str, args: argparse.Namespace) -> tuple[bytes, str]:
     request_parts = [{"text": args.prompt}]
-    if args.input_image_bytes is not None:
+    for content, mime_type in zip(args.input_image_bytes, args.input_image_mimes, strict=True):
         request_parts.append({
             "inlineData": {
-                "mimeType": args.input_image_mime,
-                "data": base64.b64encode(args.input_image_bytes).decode("ascii"),
+                "mimeType": mime_type,
+                "data": base64.b64encode(content).decode("ascii"),
             }
         })
     generation_config = {"responseModalities": ["IMAGE"]}
@@ -522,7 +529,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-history", action="store_true", help="Do not write local studio task history metadata.")
     parser.add_argument("--connection-id", default="", help=argparse.SUPPRESS)
     parser.add_argument("--connection-name", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--input-image", help="PNG, JPEG, or WebP source image for image-to-image editing.")
+    parser.add_argument(
+        "--input-image",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=f"PNG, JPEG, or WebP reference image; repeat up to {MAX_INPUT_IMAGES} times.",
+    )
     parser.add_argument(
         "--size",
         help="OpenAI-compatible size, for example 1024x1024; Nano Banana also accepts ratios or 1K/2K/4K.",
@@ -564,11 +577,13 @@ def parse_args() -> argparse.Namespace:
             args.job_id = validate_job_id(args.job_id)
         except ValueError as exc:
             parser.error(str(exc))
-    args.input_image_path = None
-    args.input_image_bytes = None
-    args.input_image_mime = None
-    if args.input_image:
-        path = Path(args.input_image).expanduser().resolve()
+    if len(args.input_image) > MAX_INPUT_IMAGES:
+        parser.error(f"--input-image may be repeated at most {MAX_INPUT_IMAGES} times")
+    args.input_image_paths = []
+    args.input_image_bytes = []
+    args.input_image_mimes = []
+    for input_image in args.input_image:
+        path = Path(input_image).expanduser().resolve()
         if not path.is_file():
             parser.error(f"--input-image does not exist or is not a file: {path}")
         if path.stat().st_size > MAX_INPUT_BYTES:
@@ -578,9 +593,9 @@ def parse_args() -> argparse.Namespace:
             mime_type = input_image_mime(content)
         except (OSError, RuntimeError) as exc:
             parser.error(str(exc))
-        args.input_image_path = path
-        args.input_image_bytes = content
-        args.input_image_mime = mime_type
+        args.input_image_paths.append(path)
+        args.input_image_bytes.append(content)
+        args.input_image_mimes.append(mime_type)
     return args
 
 
@@ -668,7 +683,7 @@ def main() -> int:
         output = Path(args.output).expanduser().resolve()
         gallery_dir = Path(args.gallery_dir).expanduser().resolve()
         output.parent.mkdir(parents=True, exist_ok=True)
-        mode = "image-to-image" if args.input_image_bytes is not None else "text-to-image"
+        mode = "image-to-image" if args.input_image_bytes else "text-to-image"
         job_id = args.job_id or f"codex-{datetime.now().strftime('%Y%m%d%H%M%S')}-{secrets.token_hex(3)}"
         job_name = str(args.name or output.stem).strip()[:120] or output.stem
         created_at = now_iso()
@@ -830,7 +845,7 @@ def main() -> int:
             result = {
                 "model": job_context["model"],
                 "protocol": job_context["protocol"],
-                "mode": "image-to-image" if args.input_image_bytes is not None else "text-to-image",
+                "mode": "image-to-image" if args.input_image_bytes else "text-to-image",
                 "requested": job_context["count"],
                 "concurrency": job_context["concurrency"],
                 "succeeded": 0,

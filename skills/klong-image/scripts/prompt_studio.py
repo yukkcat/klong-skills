@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import copy
 import hashlib
 import ipaddress
@@ -65,7 +66,9 @@ for _ratio, (_width, _height) in GEMINI_BASE_SIZES.items():
 REGISTRY_MANIFEST_MAX_BYTES = 128 * 1024
 REGISTRY_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
 REGISTRY_TIMEOUT = 30
-MAX_BODY_BYTES = 30 * 1024 * 1024
+MAX_INPUT_IMAGES = 5
+MAX_INPUT_BYTES = 20 * 1024 * 1024
+MAX_BODY_BYTES = MAX_INPUT_IMAGES * (((MAX_INPUT_BYTES + 2) // 3) * 4) + 2 * 1024 * 1024
 MAX_PREVIEW_BYTES = 12 * 1024 * 1024
 MAX_GALLERY_BATCH = 10_000
 SOURCE_TIMEOUT = 12
@@ -128,6 +131,21 @@ def clean(value: object) -> str:
 def clean_multiline(value: object) -> str:
     text = str(value or "").replace("\r\n", "\n").replace("\r", "\n")
     return "\n".join(line.rstrip() for line in text.splitlines()).strip()
+
+
+def normalize_input_images(payload: dict[str, Any]) -> list[str]:
+    if "input_images" in payload:
+        values = payload.get("input_images")
+        if not isinstance(values, list):
+            raise ValueError("input_images must be an array")
+    else:
+        legacy = payload.get("input_image")
+        values = [legacy] if legacy else []
+    if len(values) > MAX_INPUT_IMAGES:
+        raise ValueError(f"input_images must contain at most {MAX_INPUT_IMAGES} images")
+    if any(not isinstance(value, str) or not value for value in values):
+        raise ValueError("every input image must be a non-empty data URL")
+    return values
 
 
 def job_output_stem(value: object, job_id: str) -> str:
@@ -1751,11 +1769,14 @@ class Jobs:
         if continue_job_id and not previous_job:
             raise ValueError("要继续的任务不存在")
 
+        input_images = normalize_input_images(payload)
+        payload = {**payload, "input_images": input_images}
+        payload.pop("input_image", None)
         previous_result, previous_batches = continuation_result(previous_job)
         job_id = continue_job_id or secrets.token_hex(8)
         batch_id = secrets.token_hex(8)
         created_at = now_iso()
-        mode = "image-to-image" if payload.get("input_image") else "text-to-image"
+        mode = "image-to-image" if input_images else "text-to-image"
         size = clean(payload.get("size"))
         requested_protocol = clean(payload.get("protocol"))
         model_family = model.lower()
@@ -1894,22 +1915,33 @@ class Jobs:
             )
             job["result"] = self.gallery.record_job(job, payload, merged)
 
-        temp_path = None
-        image_data = payload.get("input_image")
-        if image_data:
-            try:
-                header, encoded = str(image_data).split(",", 1)
-                suffix = ".png" if "png" in header else ".webp" if "webp" in header else ".jpg"
+        temp_paths: list[str] = []
+        try:
+            for index, image_data in enumerate(payload.get("input_images") or [], start=1):
+                header, encoded = image_data.split(",", 1)
+                matched = re.fullmatch(r"data:(image/(?:png|jpeg|webp));base64", header, re.IGNORECASE)
+                if not matched:
+                    raise ValueError(f"reference image {index} must be a PNG, JPEG, or WebP data URL")
+                mime_type = matched.group(1).lower()
                 content = base64.b64decode(encoded, validate=True)
-                if len(content) > 20 * 1024 * 1024:
-                    raise ValueError("input image exceeds 20 MiB")
+                if not content or len(content) > MAX_INPUT_BYTES:
+                    raise ValueError(f"reference image {index} must be non-empty and not exceed 20 MiB")
+                if image_mime(content) != mime_type:
+                    raise ValueError(f"reference image {index} content does not match its MIME type")
+                suffix = ".png" if mime_type == "image/png" else ".webp" if mime_type == "image/webp" else ".jpg"
                 handle = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-                handle.write(content); handle.close(); temp_path = handle.name
-                command += ["--input-image", temp_path]
-            except (ValueError, TypeError) as exc:
-                message = f"Invalid input image: {exc}"
-                finish({"failed": batch["count"], "failures": [{"error": message}]}, "failed", message)
-                return
+                temp_paths.append(handle.name)
+                try:
+                    handle.write(content)
+                finally:
+                    handle.close()
+                command += ["--input-image", handle.name]
+        except (binascii.Error, OSError, TypeError, ValueError) as exc:
+            for temp_path in temp_paths:
+                Path(temp_path).unlink(missing_ok=True)
+            message = f"Invalid input image: {exc}"
+            finish({"failed": batch["count"], "failures": [{"error": message}]}, "failed", message)
+            return
 
         started_at = now_iso()
         job.update(status="running", started_at=started_at, updated_at=started_at)
@@ -1956,7 +1988,7 @@ class Jobs:
             except OSError:
                 job.update(status="failed", updated_at=now_iso(), completed_at=now_iso(), error=str(exc))
         finally:
-            if temp_path:
+            for temp_path in temp_paths:
                 Path(temp_path).unlink(missing_ok=True)
 
     def get(self, job_id: str) -> dict[str, Any] | None:

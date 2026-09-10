@@ -86,6 +86,9 @@ const DB_NAME = 'klong-prompt-studio'
 const DB_VERSION = 1
 const DEFAULT_BASE_URL = 'https://api.klong.lat'
 const DEFAULT_MODEL = 'gpt-image-2'
+const MAX_INPUT_IMAGES = 5
+const MAX_INPUT_BYTES = 20 * 1024 * 1024
+const INPUT_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp'])
 const PROMPT_REGISTRY_BASE = 'https://raw.githubusercontent.com/yukkcat/image-prompts/main/dist'
 const PROMPT_REGISTRY_MANIFEST_MAX_BYTES = 128 * 1024
 const PROMPT_REGISTRY_PAYLOAD_MAX_BYTES = 8 * 1024 * 1024
@@ -116,6 +119,34 @@ function randomId() {
 
 function plainRecord(value: unknown): value is Record<string, any> {
   return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+}
+
+function normalizeInputImages(payload: Record<string, any>) {
+  let values: unknown[]
+  if ('input_images' in payload) {
+    if (!Array.isArray(payload.input_images)) throw new Error('input_images 必须是数组')
+    values = payload.input_images
+  } else {
+    values = payload.input_image ? [payload.input_image] : []
+  }
+  if (values.length > MAX_INPUT_IMAGES) throw new Error(`参考图片最多 ${MAX_INPUT_IMAGES} 张`)
+
+  return values.map((value, index) => {
+    if (typeof value !== 'string') throw new Error(`第 ${index + 1} 张参考图片不是有效的数据 URL`)
+    const comma = value.indexOf(',')
+    const header = comma >= 0 ? value.slice(0, comma).toLowerCase() : ''
+    const data = comma >= 0 ? value.slice(comma + 1) : ''
+    const mimeType = header.match(/^data:(image\/(?:png|jpeg|webp));base64$/)?.[1] || ''
+    if (!INPUT_IMAGE_TYPES.has(mimeType) || !data || data.length % 4 !== 0 || !/^[A-Za-z0-9+/]*={0,2}$/.test(data)) {
+      throw new Error(`第 ${index + 1} 张参考图片必须是 PNG、JPEG 或 WebP`)
+    }
+    const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0
+    const byteLength = Math.floor(data.length * 3 / 4) - padding
+    if (byteLength <= 0 || byteLength > MAX_INPUT_BYTES) {
+      throw new Error(`第 ${index + 1} 张参考图片不能超过 ${MAX_INPUT_BYTES / 1024 / 1024} MiB`)
+    }
+    return value
+  })
 }
 
 function normalizeGeminiImageConfig(payload: Record<string, any>, size: string) {
@@ -580,6 +611,14 @@ async function responseError(response: Response) {
 async function dataUrlToBlob(value: string) {
   const response = await fetch(value)
   return response.blob()
+}
+
+async function inputImageBlob(value: string, index: number) {
+  const blob = await dataUrlToBlob(value)
+  if (!INPUT_IMAGE_TYPES.has(blob.type) || !blob.size || blob.size > MAX_INPUT_BYTES) {
+    throw new Error(`第 ${index + 1} 张参考图片无效或超过 ${MAX_INPUT_BYTES / 1024 / 1024} MiB`)
+  }
+  return blob
 }
 
 function httpUrl(value: unknown) {
@@ -1195,7 +1234,16 @@ class BrowserRuntime implements StudioRuntime {
     const geminiImageConfig = modelProtocol === 'gemini'
       ? normalizeGeminiImageConfig(payload, size)
       : { aspect_ratio: '', image_size: '' }
-    const normalizedPayload = { ...payload, size, ...geminiImageConfig }
+    const inputImages = normalizeInputImages(payload)
+    const inputImageBlobs = await Promise.all(inputImages.map(inputImageBlob))
+    const normalizedPayload: Record<string, any> = {
+      ...payload,
+      size,
+      ...geminiImageConfig,
+      input_images: inputImages,
+      input_image_blobs: inputImageBlobs,
+    }
+    delete normalizedPayload.input_image
     const { connection } = await this.resolveConnection(payload.connection_id)
     const continueJobId = String(payload.continue_job_id || '').trim()
     if (continueJobId && !/^[A-Za-z0-9_-]{1,80}$/.test(continueJobId)) throw new Error('任务 ID 无效')
@@ -1217,7 +1265,7 @@ class BrowserRuntime implements StudioRuntime {
       model,
       size,
       ...geminiImageConfig,
-      mode: payload.input_image ? 'image-to-image' : 'text-to-image',
+      mode: inputImages.length ? 'image-to-image' : 'text-to-image',
       protocol: String(payload.protocol || ''),
       connection_id: connection.id,
       connection_name: connection.name,
@@ -1294,7 +1342,7 @@ class BrowserRuntime implements StudioRuntime {
             prompt: job.prompt,
             model: job.model,
             protocol: generated.protocol,
-            mode: payload.input_image ? 'image-to-image' : 'text-to-image',
+            mode: payload.input_images?.length ? 'image-to-image' : 'text-to-image',
             connection_id: batch.connection_id,
             connection_name: batch.connection_name,
             ...dimensions,
@@ -1392,10 +1440,12 @@ class BrowserRuntime implements StudioRuntime {
     const timeoutSeconds = 600
     const timeout = window.setTimeout(() => controller.abort(), timeoutSeconds * 1000)
     try {
+      const inputImages = Array.isArray(payload.input_images) ? payload.input_images as string[] : []
+      const inputImageBlobs = Array.isArray(payload.input_image_blobs) ? payload.input_image_blobs as Blob[] : []
       if (protocol === 'gemini') {
         const parts: Array<Record<string, any>> = [{ text: job.prompt }]
-        if (payload.input_image) {
-          const [header, data] = String(payload.input_image).split(',', 2)
+        for (const inputImage of inputImages) {
+          const [header, data] = inputImage.split(',', 2)
           parts.push({ inlineData: { mimeType: header.match(/^data:([^;]+)/)?.[1] || 'image/png', data } })
         }
         const imageSettings = normalizeGeminiImageConfig(job, String(job.size || ''))
@@ -1424,15 +1474,17 @@ class BrowserRuntime implements StudioRuntime {
       }
 
       let response: Response
-      if (payload.input_image) {
-        const image = await dataUrlToBlob(String(payload.input_image))
+      if (inputImageBlobs.length) {
         const body = new FormData()
         body.set('model', job.model)
         body.set('prompt', job.prompt)
         body.set('n', '1')
         if (job.size) body.set('size', job.size)
         if (payload.quality) body.set('quality', String(payload.quality))
-        body.set('image', image, `reference.${image.type.includes('webp') ? 'webp' : image.type.includes('png') ? 'png' : 'jpg'}`)
+        inputImageBlobs.forEach((image, index) => {
+          const extension = image.type.includes('webp') ? 'webp' : image.type.includes('png') ? 'png' : 'jpg'
+          body.append('image', image, `reference-${index + 1}.${extension}`)
+        })
         response = await fetch(apiUrl(connection.base_url, '/v1/images/edits'), {
           method: 'POST', headers: { Authorization: `Bearer ${apiKey}` }, body, credentials: 'omit', signal: controller.signal,
         })

@@ -33,7 +33,7 @@ In browser mode, each visitor configures their own connection. API keys are encr
 2. If current availability matters, run `--list-models`. It returns the recognized image models visible to the active Key. Choose `gpt-image-2` by default, or `gemini-3.1-flash-image-preview` when native Gemini is requested.
    Read [references/models.md](references/models.md) when comparing current routes, protocols, quality options, or transport safeguards.
 3. Save direct Codex output in the directory resolved by `connection_store.resolve_output_directory()`, which honors `KLONG_OUTPUT_DIR`, Prompt Studio's saved location, then `<current-workspace>/outputs/prompt-studio`. Use a descriptive filename inside that directory. `generate.py` automatically records the task under `.klong/jobs`; do not create or edit manifests manually. Only write elsewhere when the user explicitly requests another location, and note that outputs outside the shared gallery are not added to web history.
-4. For image-to-image work, identify the source PNG, JPEG, or WebP file and pass it with `--input-image`.
+4. For image-to-image work, identify up to five source PNG, JPEG, or WebP files and pass each one with a separate `--input-image` argument.
 5. Run:
 
 ```shell
@@ -57,12 +57,12 @@ Progress is written to stderr and final machine-readable JSON is written to stdo
 Edit an existing image:
 
 ```shell
-python <skill-dir>/scripts/generate.py --model gpt-image-2.5 --input-image source.png --prompt "Keep the subject and change the background to a snowy mountain" --output outputs/prompt-studio/edited.png
+python <skill-dir>/scripts/generate.py --model gpt-image-2.5 --input-image source.png --input-image style.png --prompt "Keep the subject and change the background to a snowy mountain" --output outputs/prompt-studio/edited.png
 ```
 
-OpenAI-compatible models send multipart requests to `/v1/images/edits`. Gemini models send the source image as `inlineData` alongside the prompt. Input images must be PNG, JPEG, or WebP and no larger than 20 MiB.
+OpenAI-compatible models send multipart requests to `/v1/images/edits`, repeating the `image` field for each reference. Gemini models send every source image as a separate `inlineData` part alongside the prompt. Accept one to five PNG, JPEG, or WebP inputs, each no larger than 20 MiB. Prompt Studio users can select, drag, or paste those references and remove them individually before generation.
 
-Use `--count` and `--concurrency` to create multiple variants from the same source image. Each request receives the original source image; outputs are not chained into later requests.
+Use `--count` and `--concurrency` to create multiple variants from the same source set. Each request receives all original reference images; outputs are not chained into later requests.
 
 ## Batch Generation
 

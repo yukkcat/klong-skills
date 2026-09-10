@@ -408,7 +408,7 @@
                 <div><span class="eyebrow">CREATE</span><h1>创作设置</h1></div>
                 <div class="creation-header-actions">
                   <Button
-                    v-if="job || selected || form.prompt.trim() || inputFile"
+                    v-if="job || selected || form.prompt.trim() || inputImages.length"
                     size="sm"
                     variant="outline"
                     @click="startNewCreation"
@@ -443,19 +443,48 @@
                 </section>
 
                 <section class="creation-control-section reference-section">
-                  <div class="section-title"><h3>参考图片</h3><span>{{ inputFile ? '图生图' : '可选' }}</span></div>
-                  <label class="workbench-upload" :class="{ active: inputFile }">
-                    <input ref="inputFileControl" type="file" accept="image/png,image/jpeg,image/webp" @change="onFile" />
-                    <span v-if="inputPreviewUrl" class="reference-thumbnail"><img :src="inputPreviewUrl" :alt="inputFile?.name || '参考图片'" /></span>
-                    <span v-else class="reference-placeholder"><Icon icon="lucide:image-plus" /></span>
-                    <span class="reference-copy">
-                      <strong>{{ inputFile ? inputFile.name : '添加参考图片' }}</strong>
-                      <small>{{ inputFile ? formatBytes(inputFile.size) : 'PNG、JPEG 或 WebP，最大 20 MiB' }}</small>
-                    </span>
-                    <Button v-if="inputFile" size="xs" variant="ghost" icon-only title="移除参考图片" @click.prevent.stop="clearInputFile">
-                      <Icon icon="lucide:x" />
-                    </Button>
-                  </label>
+                  <div class="section-title">
+                    <h3>参考图片</h3>
+                    <span>{{ inputImages.length ? `${inputImages.length}/${MAX_INPUT_IMAGES} · 图生图` : `可选 · 最多 ${MAX_INPUT_IMAGES} 张` }}</span>
+                  </div>
+                  <div
+                    class="workbench-upload"
+                    :class="{ active: inputImages.length, dragging: referenceDragging, full: !canAddInputImages }"
+                    @dragenter.prevent="referenceDragging = true"
+                    @dragover.prevent="onReferenceDragOver"
+                    @dragleave="onReferenceDragLeave"
+                    @drop.prevent="onReferenceDrop"
+                  >
+                    <input ref="inputFileControl" type="file" accept="image/png,image/jpeg,image/webp" multiple @change="onFiles" />
+
+                    <div v-if="inputImages.length" class="reference-grid">
+                      <figure v-for="image in inputImages" :key="image.id" class="reference-thumbnail">
+                        <img :src="image.previewUrl" :alt="image.file.name || '参考图片'" />
+                        <button type="button" class="reference-remove" :aria-label="`移除 ${image.file.name || '参考图片'}`" @click="removeInputImage(image.id)">
+                          <Icon icon="lucide:x" />
+                        </button>
+                      </figure>
+                      <button v-if="canAddInputImages" type="button" class="reference-add-tile" title="继续添加参考图片" @click="openInputFilePicker">
+                        <Icon icon="lucide:plus" />
+                        <span>添加</span>
+                      </button>
+                    </div>
+
+                    <button v-else type="button" class="reference-empty-state" @click="openInputFilePicker">
+                      <span class="reference-placeholder"><Icon icon="lucide:image-plus" /></span>
+                      <span class="reference-copy">
+                        <strong>{{ referenceDragging ? '松开即可添加' : '选择、拖入或粘贴图片' }}</strong>
+                        <small>PNG、JPEG 或 WebP，每张最大 20 MiB</small>
+                      </span>
+                    </button>
+
+                    <div v-if="inputImages.length" class="reference-copy reference-summary">
+                      <strong>已添加 {{ inputImages.length }} 张参考图片</strong>
+                      <small v-if="referenceDragging">松开即可添加</small>
+                      <small v-else-if="canAddInputImages">可继续选择、拖入或粘贴，每张最大 20 MiB</small>
+                      <small v-else>已达到 {{ MAX_INPUT_IMAGES }} 张上限，可移除后替换</small>
+                    </div>
+                  </div>
                 </section>
 
                 <section class="creation-control-section parameter-section">
@@ -1568,8 +1597,16 @@ type ConfirmationOptions = {
   tone?: 'neutral' | 'danger'
 }
 type ConfirmationState = Required<ConfirmationOptions>
+type ReferenceImage = {
+  id: string
+  file: File
+  previewUrl: string
+}
 
 const PAGE_SIZE = 24
+const MAX_INPUT_IMAGES = 5
+const MAX_INPUT_BYTES = 20 * 1024 * 1024
+const INPUT_IMAGE_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp'])
 const appVersion = packageInfo.version
 const repositoryUrl = 'https://github.com/yukkcat/klong-skills'
 const updateCheckUrl = 'https://api.github.com/repos/yukkcat/klong-skills/tags?per_page=20'
@@ -1646,9 +1683,9 @@ const settingsOpen = ref(false)
 const connectionOpen = ref(false)
 const settingsSection = ref<SettingsSection>('connections')
 const selected = ref<Prompt | null>(null)
-const inputFile = ref<File | null>(null)
+const inputImages = ref<ReferenceImage[]>([])
 const inputFileControl = ref<HTMLInputElement | null>(null)
-const inputPreviewUrl = ref('')
+const referenceDragging = ref(false)
 const submitting = ref(false)
 const job = ref<Job | null>(null)
 const jobHistory = ref<JobSummary[]>([])
@@ -1713,10 +1750,12 @@ let libraryTimer: ReturnType<typeof setTimeout> | undefined
 let requestVersion = 0
 let galleryRequestVersion = 0
 let toastSequence = 0
+let inputImageSequence = 0
 let confirmationResolver: ((confirmed: boolean) => void) | null = null
 const pollingJobIds = new Set<string>()
 
 const readySources = computed(() => library.sources.filter((source: any) => Number(source.count) > 0).length)
+const canAddInputImages = computed(() => inputImages.value.length < MAX_INPUT_IMAGES)
 const syncLabel = computed(() => library.syncing ? '同步中' : '已同步')
 const connections = computed<ConnectionProfile[]>(() => settingsStatus.connections || [])
 const activeConnection = computed<ConnectionProfile | null>(() => (
@@ -2387,7 +2426,7 @@ async function startNewCreation() {
   settingsOpen.value = false
   selected.value = null
   job.value = null
-  clearInputFile()
+  clearInputImages()
   submitting.value = false
   startedAt.value = 0
   elapsed.value = 0
@@ -2810,27 +2849,128 @@ function normalizeModel() {
   form.concurrency = Math.max(1, Number(form.count) || 1)
 }
 
-function clearInputFile() {
-  if (inputPreviewUrl.value) URL.revokeObjectURL(inputPreviewUrl.value)
-  inputPreviewUrl.value = ''
-  inputFile.value = null
+function clearInputImages() {
+  inputImages.value.forEach((image) => URL.revokeObjectURL(image.previewUrl))
+  inputImages.value = []
+  referenceDragging.value = false
   if (inputFileControl.value) inputFileControl.value.value = ''
 }
 
-function onFile(event: Event) {
-  const file = (event.target as HTMLInputElement).files?.[0] || null
-  clearInputFile()
-  inputFile.value = file
-  if (file) inputPreviewUrl.value = URL.createObjectURL(file)
+function removeInputImage(id: string) {
+  const image = inputImages.value.find((item) => item.id === id)
+  if (!image) return
+  URL.revokeObjectURL(image.previewUrl)
+  inputImages.value = inputImages.value.filter((item) => item.id !== id)
+  if (inputFileControl.value) inputFileControl.value.value = ''
 }
 
-function fileData(file: File | null) {
-  if (!file) return Promise.resolve(null)
-  if (file.size > 20 * 1024 * 1024) return Promise.reject(new Error('参考图片不能超过 20 MiB'))
-  return new Promise((resolve, reject) => {
+function openInputFilePicker() {
+  if (!canAddInputImages.value) {
+    showToast('warning', `最多只能添加 ${MAX_INPUT_IMAGES} 张参考图片`)
+    return
+  }
+  inputFileControl.value?.click()
+}
+
+function normalizedInputFile(file: File) {
+  const declaredType = String(file.type || '').toLowerCase()
+  if (INPUT_IMAGE_TYPES.has(declaredType)) return file
+  if (declaredType) return null
+  const extension = file.name.split('.').pop()?.toLowerCase()
+  const inferredType = extension === 'png' ? 'image/png'
+    : ['jpg', 'jpeg'].includes(extension || '') ? 'image/jpeg'
+      : extension === 'webp' ? 'image/webp' : ''
+  return inferredType ? new File([file], file.name, { type: inferredType, lastModified: file.lastModified }) : null
+}
+
+function addInputFiles(files: Iterable<File>) {
+  let invalidType = 0
+  let oversized = 0
+  let empty = 0
+  let overflow = 0
+  const additions: ReferenceImage[] = []
+  let remaining = MAX_INPUT_IMAGES - inputImages.value.length
+
+  for (const candidate of files) {
+    const file = normalizedInputFile(candidate)
+    if (!file) {
+      invalidType += 1
+      continue
+    }
+    if (!file.size) {
+      empty += 1
+      continue
+    }
+    if (file.size > MAX_INPUT_BYTES) {
+      oversized += 1
+      continue
+    }
+    if (remaining <= 0) {
+      overflow += 1
+      continue
+    }
+    additions.push({
+      id: `reference-${Date.now()}-${++inputImageSequence}`,
+      file,
+      previewUrl: URL.createObjectURL(file),
+    })
+    remaining -= 1
+  }
+
+  if (additions.length) inputImages.value = [...inputImages.value, ...additions]
+  const warnings: string[] = []
+  if (invalidType) warnings.push(`${invalidType} 张格式不支持`)
+  if (oversized) warnings.push(`${oversized} 张超过 20 MiB`)
+  if (empty) warnings.push(`${empty} 张内容为空`)
+  if (overflow) warnings.push(`最多 ${MAX_INPUT_IMAGES} 张，另有 ${overflow} 张未添加`)
+  if (warnings.length) showToast('warning', warnings.join('；'))
+}
+
+function onFiles(event: Event) {
+  const control = event.target as HTMLInputElement
+  addInputFiles(Array.from(control.files || []))
+  control.value = ''
+}
+
+function onReferenceDragOver(event: DragEvent) {
+  referenceDragging.value = true
+  if (event.dataTransfer) event.dataTransfer.dropEffect = canAddInputImages.value ? 'copy' : 'none'
+}
+
+function onReferenceDragLeave(event: DragEvent) {
+  const current = event.currentTarget as HTMLElement | null
+  if (current && event.relatedTarget instanceof Node && current.contains(event.relatedTarget)) return
+  referenceDragging.value = false
+}
+
+function onReferenceDrop(event: DragEvent) {
+  referenceDragging.value = false
+  const files = Array.from(event.dataTransfer?.files || [])
+  if (!files.length) {
+    showToast('warning', '没有检测到可添加的图片文件')
+    return
+  }
+  addInputFiles(files)
+}
+
+function onPasteImages(event: ClipboardEvent) {
+  if (activeView.value !== 'create') return
+  const itemFiles = Array.from(event.clipboardData?.items || [])
+    .filter((item) => item.kind === 'file')
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => Boolean(file))
+  const files = itemFiles.length ? itemFiles : Array.from(event.clipboardData?.files || [])
+  if (!files.length) return
+  event.preventDefault()
+  addInputFiles(files)
+}
+
+function fileData(file: File) {
+  if (file.size > MAX_INPUT_BYTES) return Promise.reject(new Error(`每张参考图片不能超过 ${MAX_INPUT_BYTES / 1024 / 1024} MiB`))
+  return new Promise<string>((resolve, reject) => {
     const reader = new FileReader()
-    reader.onload = () => resolve(reader.result)
-    reader.onerror = reject
+    reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error(`无法读取参考图片 ${file.name}`))
+    reader.onerror = () => reject(new Error(`无法读取参考图片 ${file.name}`))
     reader.readAsDataURL(file)
   })
 }
@@ -2853,6 +2993,7 @@ async function createJob() {
     if (concurrency > count) throw new Error('并发数不能超过生成数量')
     if (isNanoBananaModel(form.model)) form.size = normalizeNanoBananaSize(form.size)
     else if (!isExactImageModel(form.model)) form.size = constrainImageSizeValue(form.size)
+    const inputImageData = await Promise.all(inputImages.value.map((image) => fileData(image.file)))
     const payload = {
       ...form,
       aspect_ratio: isGeminiModel.value ? form.aspect_ratio : '',
@@ -2862,7 +3003,7 @@ async function createJob() {
       continue_job_id: job.value?.id || '',
       count,
       concurrency,
-      input_image: await fileData(inputFile.value),
+      input_images: inputImageData,
     }
     const createdJob: Job = await api('/api/jobs', {
       method: 'POST',
@@ -2959,7 +3100,7 @@ async function restoreHistoryJob(item: JobSummary) {
     const restored = await api(`/api/jobs/${item.id}`)
     job.value = restored
     selected.value = null
-    clearInputFile()
+    clearInputImages()
     form.prompt = restored.prompt || ''
     form.model = restored.model || form.model
     form.size = restored.size || ''
@@ -3106,6 +3247,7 @@ function bindObserver() {
 
 onMounted(async () => {
   window.addEventListener('keydown', onKeydown)
+  window.addEventListener('paste', onPasteImages)
   await getRuntime()
   await Promise.all([loadSettings(), loadStorage()])
   await loadJobHistory()
@@ -3126,8 +3268,9 @@ onMounted(async () => {
 
 onUnmounted(() => {
   window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('paste', onPasteImages)
   observer?.disconnect()
-  if (inputPreviewUrl.value) URL.revokeObjectURL(inputPreviewUrl.value)
+  clearInputImages()
   if (filterTimer) clearTimeout(filterTimer)
   if (galleryFilterTimer) clearTimeout(galleryFilterTimer)
   if (libraryTimer) clearTimeout(libraryTimer)
